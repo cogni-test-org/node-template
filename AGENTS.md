@@ -7,6 +7,26 @@
 > `provision-env`, or touch Argo. See `docs/spec/node-ci-cd-contract.md` in the
 > operator monorepo for the full two-views model.
 
+## Your cognition is delivered at session start
+
+A SessionStart hook ([`.claude/settings.json`](.claude/settings.json) for Claude Code,
+[`.codex/config.toml`](.codex/config.toml) for Codex) runs the shared loader
+[`scripts/agent/session-cognition.sh`](scripts/agent/session-cognition.sh), which pulls a
+**cognition bundle** — tooling invariants + a live skills index + knowledge-domain pointers —
+and injects it into context. Codex needs a one-time trust (`/hooks`).
+
+- The loader derives `https://<node-slug>.cognidao.org/api/v1/cognition` from
+  `.cogni/repo-spec.yaml` `intent.name`; there is no `COGNI_COGNITION_URL`
+  override. If this node's own hub is not deployed yet, it falls back to the
+  operator (`https://cognidao.org/api/v1/cognition`) for the shared Cogni agent
+  contract.
+- Self-serve any time cognition does not load: register once with
+  `POST https://cognidao.org/api/v1/agent/register`, save `COGNI_API_KEY=<apiKey>`
+  in `.env.cogni`, then retry. Conductor setup symlinks `.env.cogni` into future
+  worktrees, so spawned sessions need no per-worktree key export.
+- Manual fetch shape (cognition needs a principal): `curl -fsS -H "Authorization: Bearer $COGNI_API_KEY" "https://cognidao.org/api/v1/cognition" | jq -r .markdown`.
+- This node serves its own bundle at `GET /api/v1/cognition` (authed, index-only — needs a principal; `/api/v1/agent/register` stays the one public bootstrap seam).
+
 ## What you own (node-dev half)
 
 - **App + graphs + packages** at the repo root.
