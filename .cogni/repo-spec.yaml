@@ -55,3 +55,11 @@ gates:
   - type: ai-rule
     with:
       rule_file: repo-goal-alignment.yaml
+
+governance:
+  token_contract: "0x0166Db3d42603E790Fb685059DcAa37087B032c8"
+  emissions_holder: "0x717a747df71111a678202BfCD2E3B0081A9aeB56"
+
+distributions:
+  status: active
+  claim_contract_pattern: uniswap.merkle-distributor.v1
