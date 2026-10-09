@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.app.json --noEmit",
     "test": "vitest run",
     "test:component": "vitest run --config vitest.component.config.mts",
+    "test:doltgres": "vitest run --config vitest.doltgres.config.mts",
     "test:external": "vitest run --config vitest.external.config.mts",
     "test:external:money": "vitest run --config vitest.external-money.config.mts"
   },
@@ -33,7 +34,7 @@
     "@cogni/graph-execution-host": "workspace:*",
     "@cogni/ids": "workspace:*",
     "@cogni/ingestion-core": "workspace:*",
-    "@cogni/knowledge-store": "workspace:*",
+    "@cogni/knowledge-store": "workspace:@cogni-dao/knowledge-store@*",
     "@cogni/langgraph-graphs": "workspace:*",
     "@cogni/node-app": "workspace:*",
     "@cogni/node-contracts": "workspace:*",
@@ -44,7 +45,7 @@
     "@cogni/operator-wallet": "workspace:*",
     "@cogni/repo-spec": "workspace:*",
     "@cogni/scheduler-core": "workspace:*",
-    "@cogni/work-items": "workspace:*",
+    "@cogni/work-items": "workspace:@cogni-dao/work-items@*",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/modifiers": "^9.0.0",
     "@dnd-kit/sortable": "^10.0.0",
@@ -139,6 +140,7 @@
     "happy-dom": "^20.8.9",
     "jsdom": "^27.1.0",
     "next-test-api-route-handler": "^5.0.3",
+    "testcontainers": "11.14.0",
     "undici": "^7.24.0",
     "vite-tsconfig-paths": "^5.1.4",
     "vitest": "^4.0.9"

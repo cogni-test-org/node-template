@@ -70,6 +70,7 @@ import { numberToPpm } from "@cogni/operator-wallet";
 import { PrivyOperatorWalletAdapter } from "@cogni/operator-wallet/adapters/privy";
 import type { ScheduleControlPort } from "@cogni/scheduler-core";
 import type { WorkItemQueryPort } from "@cogni/work-items";
+import { DoltgresWorkItemAdapter } from "@cogni/work-items/adapters/doltgres";
 import { MarkdownWorkItemAdapter } from "@cogni/work-items/markdown";
 import {
 	Client as TemporalClient,
@@ -168,6 +169,7 @@ import type {
 	ExecutionRequestPort,
 	GraphRunRepository,
 	ScheduleUserPort,
+	WorkItemsDoltgresPort,
 } from "@/ports/server";
 import {
 	getDaoTreasuryAddress,
@@ -186,6 +188,13 @@ import { USDC_TOKEN_ADDRESS } from "@/shared/web3";
 import type { EvmOnchainClient } from "@/shared/web3/onchain/evm-onchain-client.interface";
 
 export type UnhandledErrorPolicy = "rethrow" | "respond_500";
+
+class DoltgresNotConfiguredError extends Error {
+	constructor() {
+		super("Doltgres is not configured for this node. Set DOLTGRES_URL to enable the work-items API.");
+		this.name = "DoltgresNotConfiguredError";
+	}
+}
 
 export interface ContainerConfig {
 	/** How to handle unhandled errors in route wrappers: rethrow for dev/test, respond_500 for production safety */
@@ -245,6 +254,8 @@ export interface Container {
 	attributionStore: AttributionStore;
 	/** Work item queries — reads from markdown files via WorkItemQueryPort */
 	workItemQuery: WorkItemQueryPort;
+	/** Node-local Doltgres work-item query/create/patch/delete surface. */
+	doltgresWorkItems: WorkItemsDoltgresPort;
 	/** Run event streaming — publish/subscribe via Redis Streams */
 	runStream: RunStreamPort;
 	/** Node-level event streaming — undefined when REDIS_URL not set */
@@ -696,10 +707,24 @@ function createContainer(): Container {
 	let edoCapability: EdoCapability;
 	let knowledgeContributionService: ContributionService | undefined;
 	let knowledgeStorePort: KnowledgeStorePort | undefined;
+	let doltgresWorkItems: WorkItemsDoltgresPort;
 	if (env.DOLTGRES_URL) {
 		const doltClient = buildDoltgresClient({
 			connectionString: env.DOLTGRES_URL,
 			applicationName: `cogni_knowledge_${env.SERVICE_NAME ?? "app"}`,
+		});
+		const createWorkItemsClient = () =>
+			buildDoltgresClient({
+				connectionString: env.DOLTGRES_URL as string,
+				applicationName: `cogni_work_items_${env.SERVICE_NAME ?? "app"}`,
+				max: 1,
+			});
+		const workItemsClient = createWorkItemsClient();
+		// Node stores start their allocator at 1; operator alone reserves the
+		// imported legacy range below 5000.
+		doltgresWorkItems = new DoltgresWorkItemAdapter(workItemsClient, {
+			logger: log,
+			recreateClient: createWorkItemsClient,
 		});
 		const knowledgePort = new DoltgresKnowledgeStoreAdapter({
 			sql: doltClient,
@@ -711,8 +736,23 @@ function createContainer(): Container {
 			store: knowledgePort,
 		});
 		edoCapability = createEdoCapability(knowledgePort, edoResolver);
+		// Branch work gets its own `max: 1` client, deliberately NOT the pool that
+		// serves reads. Dolt branch ops need a session-pinned connection; bounding
+		// them above the pool (FIFO + advisory lock, see `DoltBranchSessionRunner`)
+		// is what keeps a burst of admin rejects from burning every slot — and
+		// keeping them off the read pool is what keeps knowledge reads alive while
+		// a write is degraded (bug.5391, bug.5358).
+		const createKnowledgeBranchClient = () =>
+			buildDoltgresClient({
+				connectionString: env.DOLTGRES_URL as string,
+				applicationName: `cogni_knowledge_branch_${env.SERVICE_NAME ?? "app"}`,
+				max: 1,
+			});
 		const contributionPort = new DoltgresKnowledgeContributionAdapter({
 			sql: doltClient,
+			branchSql: createKnowledgeBranchClient(),
+			recreateBranchClient: createKnowledgeBranchClient,
+			logger: log,
 		});
 		// Optional post-merge mirror to DoltHub (task.5069). Disabled when
 		// DOLTHUB_REMOTE_URL is unset. Gate-by-secret-presence follows the
@@ -770,6 +810,19 @@ function createContainer(): Container {
 		};
 		knowledgeContributionService = undefined;
 		knowledgeStorePort = undefined;
+		const notConfiguredWorkItems = () => {
+			throw new DoltgresNotConfiguredError();
+		};
+		doltgresWorkItems = {
+			get: notConfiguredWorkItems,
+			list: notConfiguredWorkItems,
+			create: notConfiguredWorkItems,
+			patch: notConfiguredWorkItems,
+			delete: notConfiguredWorkItems,
+			claim: notConfiguredWorkItems,
+			heartbeat: notConfiguredWorkItems,
+			release: notConfiguredWorkItems,
+		};
 		log.warn("Knowledge store not configured (DOLTGRES_URL not set)");
 	}
 
@@ -943,6 +996,7 @@ function createContainer(): Container {
 		),
 		attributionStore: new DrizzleAttributionAdapter(serviceDb, getScopeId()),
 		workItemQuery: workItemAdapter,
+		doltgresWorkItems,
 		runStream,
 		nodeStream,
 		get webhookRegistrations() {

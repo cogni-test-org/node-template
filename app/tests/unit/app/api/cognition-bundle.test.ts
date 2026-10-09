@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: LicenseRef-PolyForm-Shield-1.0.0
+// SPDX-FileCopyrightText: 2025 Cogni-DAO
+
+/**
+ * Module: `@tests/unit/app/api/cognition-bundle`
+ * Purpose: Unit tests for the cognition bundle markdown renderer.
+ * Scope: Pure rendering only; route IO and hub reads are validated separately.
+ * Invariants: Session-start heading is human node identity first, deploy SHA as metadata.
+ * Side-effects: none
+ * Links: src/app/api/v1/cognition/_bundle.ts
+ * @public
+ */
+
+import { describe, expect, it } from "vitest";
+import {
+	renderBundleMarkdown,
+	resolveOrientation,
+	SESSION_BOOTSTRAP_INVARIANTS,
+	SESSION_WATCH_GATE,
+} from "@/app/api/v1/cognition/_bundle";
+
+const baseInput = {
+	node: "4ff8eac1-4eba-4ed0-931b-b1fe4f64713d",
+	name: "operator",
+	mission: "Coordinate code, deploys, and validation for Cogni nodes.",
+	generatedAt: "2026-06-16T19:31:02.838Z",
+	origin: "https://test.cognidao.org",
+	buildSha: "f52036b33ffecdf5244662e673a0d6d174c50150",
+	toolingInvariants: ["Adopt one production work item."],
+	skillsIndex: [
+		{
+			id: "node-launch-handoff",
+			title: "Node launch handoff",
+			entryType: "guide",
+			domain: "infrastructure",
+		},
+	],
+	domainPointers: [
+		{
+			domain: "infrastructure",
+			entryCount: 7,
+			description: "Runtime and deploy knowledge.",
+		},
+	],
+	orientation: null,
+} as const;
+
+describe("renderBundleMarkdown", () => {
+	it("renders name, mission, counts, and load time while demoting build SHA", () => {
+		const markdown = renderBundleMarkdown(baseInput);
+
+		const [heading, blank, subtitle, spacer, delivered] = markdown.split("\n");
+
+		expect(heading).toBe("# operator — Cogni Session Cognition");
+		expect(blank).toBe("");
+		expect(subtitle).toBe(
+			"> Coordinate code, deploys, and validation for Cogni nodes. · 1 skills · 1 domains · loaded 2026-06-16 19:31"
+		);
+		expect(spacer).toBe(">");
+		expect(delivered).toContain("node `4ff8eac1-4eba-4ed0-931b-b1fe4f64713d`");
+		expect(delivered).toContain(
+			"build `f52036b33ffecdf5244662e673a0d6d174c50150`"
+		);
+		expect(heading).not.toContain("f52036b3");
+	});
+
+	it("surfaces the derived candidate (flight + validate) URL for the node", () => {
+		// operator is the primary test apex...
+		expect(renderBundleMarkdown(baseInput)).toContain(
+			"https://test.cognidao.org"
+		);
+		// ...every other node is a slugged test host.
+		expect(renderBundleMarkdown({ ...baseInput, name: "poly" })).toContain(
+			"https://poly-test.cognidao.org"
+		);
+	});
+
+	it("always renders the node-relative work-item write seam", () => {
+		const markdown = renderBundleMarkdown({
+			...baseInput,
+			name: "poly",
+			origin: "https://poly.cognidao.org",
+			orientation: {
+				id: "poly-agent-orientation",
+				content: "Poly node operating map.",
+			},
+		});
+
+		expect(markdown).toContain("## Work items — this node's own ledger");
+		expect(markdown).toContain(
+			"POST https://poly.cognidao.org/api/v1/work/items",
+		);
+		expect(markdown).toContain(
+			"PATCH https://poly.cognidao.org/api/v1/work/items/{id}",
+		);
+		expect(markdown).toContain('{"set":{...}}');
+	});
+
+	it("renders the current-node orientation entry IN FULL above the tooling invariants", () => {
+		const fullOrientation = [
+			"**USE WHEN:** first read of every operator session.",
+			"",
+			"## Mission",
+			"Operator is the agentic git-manager. Edit nodes/operator/app.",
+			"",
+			"## Principles",
+			"- Recall before write, refine over extend.",
+		].join("\n");
+		const markdown = renderBundleMarkdown({
+			...baseInput,
+			orientation: {
+				id: "operator-agent-orientation",
+				content: fullOrientation,
+			},
+		});
+
+		expect(markdown).toContain("## Orientation — recall this first");
+		// The whole entry body is inlined, not a truncated excerpt — every section
+		// survives, including ones past the old 480-char first-paragraph cut.
+		expect(markdown).toContain(fullOrientation);
+		expect(markdown).toContain("## Mission");
+		expect(markdown).toContain("- Recall before write, refine over extend.");
+		// No second-recall footer: the bootstrap IS the orientation.
+		expect(markdown).not.toContain("for the full context");
+		// Map comes before the constitution.
+		expect(markdown.indexOf("## Orientation — recall this first")).toBeLessThan(
+			markdown.indexOf("## Tooling invariants")
+		);
+	});
+
+	// The bundle is served to every harness (Claude Code, Codex, OpenAI, plain
+	// shell) and auto-injected into a fresh session. So the "how to watch an async
+	// gate" contract must be (a) portable — one blocking shell command, no
+	// Claude-only Monitor/background primitive — and (b) XML-tagged so any model
+	// parses + recalls the exact command without prose parsing. Pin both here.
+	it("exposes a portable, XML-tagged watch-gate the render inlines", () => {
+		const g = SESSION_WATCH_GATE;
+		// Tag-structured: five parseable atoms, not a prose run-on.
+		expect(g).toContain("<watch-gate");
+		expect(g).toContain("</watch-gate>");
+		expect(g).toContain("<ci-green>");
+		expect(g).toContain("<flight-landed>");
+		expect(g).toContain("<deploy-landed>");
+		expect(g).toContain("<truth>");
+		// Portable, harness-neutral rule lives on the opening tag.
+		expect(g).toContain("ONE blocking command");
+		expect(g).toContain("no harness-specific monitor/background");
+		// (1) CI: exact one-liner + the --required trap.
+		expect(g).toContain("gh pr checks {PR} --watch --fail-fast");
+		expect(g).toContain("NOT --required");
+		// Verified against PR #2075: `static` IS a required check, so the reason to
+		// avoid --required is the gates it OMITS (e.g. build), not static. Don't let
+		// the stale "build/static live outside required" claim creep back.
+		expect(g).not.toMatch(/build\/static/);
+		// --watch blocks to a terminal state and never returns 8; exit 8 (pending)
+		// belongs only to the one-shot re-read. Guard against re-mislabeling it.
+		expect(g).toMatch(/one-shot 8=pending/);
+		// Poll must be bounded + fail loud — never an unbounded/​silent hang.
+		expect(g).toMatch(/[Bb]ound/);
+		expect(g).toContain("FAILED");
+		// Placeholders are brace-form so the ONLY angle brackets are real tags —
+		// an angle-bracket placeholder (<PR>) would collide with the tag grammar.
+		expect(g).not.toMatch(/<(PR|candidate|target|node)>/);
+		// (2)/(3) flight + deploy: /version.buildSha is the ground-truth verdict.
+		expect(g).toContain(".buildSha");
+		expect(g).toContain("only ground truth");
+		// Terse by contract: the whole block must stay short enough to recall.
+		expect(g.length).toBeLessThan(1000);
+		// The render actually inlines it under a discoverable header.
+		const markdown = renderBundleMarkdown(baseInput);
+		expect(markdown).toContain("## Watch an async gate — CI · flight · deploy");
+		expect(markdown).toContain(SESSION_WATCH_GATE);
+	});
+
+	it("keeps the CICD-sequence invariant free of the watch mechanics it delegates", () => {
+		const cicd = SESSION_BOOTSTRAP_INVARIANTS.find((line) =>
+			line.startsWith("Ship via PR")
+		);
+		// The step order lives in the invariant; the *how to watch* lives in the
+		// <watch-gate> block. The invariant points at it, never duplicates the cmd.
+		expect(cicd).toBeDefined();
+		expect(cicd).not.toContain("--fail-fast");
+		expect(cicd).toContain("<watch-gate>");
+	});
+
+	it("prompts seeding an orientation entry when none exists", () => {
+		const markdown = renderBundleMarkdown(baseInput);
+
+		expect(markdown).toContain("## Orientation — recall this first");
+		expect(markdown).toContain("No `operator-agent-orientation` entry yet");
+	});
+});
+
+describe("bundle growth — large indexes render whole, no serve-side ceiling (story.5070)", () => {
+	// The hub is designed to accumulate: every new skill/guide/playbook adds a row.
+	// Delivery is now uncapped on both runtimes (Codex raw stdout with spill off;
+	// Claude Code structured additionalContext), so the producer no longer enforces
+	// a byte ceiling. The former 16 KB cap (bug.5284) would have rejected this shape
+	// at the source and 500'd /api/v1/cognition; growth must now render whole.
+	function indexOf(rows: number, titleLen: number) {
+		return Array.from({ length: rows }, (_, i) => ({
+			id: `build-compute-entry-${i}`,
+			// A realistic worst-case row: the title carries the bulk of the bytes,
+			// the one field this node's render inlines per skill.
+			title: `Build/compute runtime knowledge entry ${i} — ${"detail ".repeat(titleLen)}`,
+			entryType: "guide",
+			domain: "infrastructure",
+		}));
+	}
+
+	it("renders a bundle well past the former 16 KB cap, whole and untruncated", () => {
+		const md = renderBundleMarkdown({
+			...baseInput,
+			skillsIndex: indexOf(80, 40),
+		});
+		const bytes = new TextEncoder().encode(
+			`${md.replace(/\n+$/, "")}\n`
+		).byteLength;
+		// Past the old ceiling — which would have thrown here.
+		expect(bytes).toBeGreaterThan(16 * 1024);
+		// The last row is present ⇒ nothing was dropped.
+		expect(md).toContain("build-compute-entry-79");
+	});
+});
+
+describe("resolveOrientation", () => {
+	const port = (rows: Record<string, string>) => ({
+		getKnowledge: async (id: string) =>
+			id in rows ? { id, content: rows[id] } : null,
+	});
+
+	it("finds the exact-id entry even when the domain scan missed it (bug.5280)", async () => {
+		// Repro: domain outgrew PER_DOMAIN_LIMIT, so the scan never saw the old
+		// orientation row and passed scannedOrientationId=null. Direct lookup
+		// must still resolve it.
+		const result = await resolveOrientation(
+			port({ "operator-agent-orientation": "the map" }),
+			"operator-agent-orientation",
+			null
+		);
+		expect(result).toEqual({
+			id: "operator-agent-orientation",
+			content: "the map",
+		});
+	});
+
+	it("falls back to the scan-found suffix entry when the exact id is absent", async () => {
+		const result = await resolveOrientation(
+			port({ "legacy-agent-orientation": "older map" }),
+			"operator-agent-orientation",
+			"legacy-agent-orientation"
+		);
+		expect(result?.id).toBe("legacy-agent-orientation");
+	});
+
+	it("falls back to the generic starter seed last, else null", async () => {
+		const seeded = await resolveOrientation(
+			port({ "cogni-agent-orientation": "starter" }),
+			"operator-agent-orientation",
+			null
+		);
+		expect(seeded?.id).toBe("cogni-agent-orientation");
+
+		const empty = await resolveOrientation(
+			port({}),
+			"operator-agent-orientation",
+			null
+		);
+		expect(empty).toBeNull();
+	});
+});

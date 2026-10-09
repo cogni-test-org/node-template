@@ -21,6 +21,7 @@ const FILES = [
   ".github/workflows/ci.yaml",
   ".github/workflows/pr-build.yml",
   ".github/workflows/pr-lint.yaml",
+  ".github/workflows/publish-packages.yml",
   ".cogni/repo-policy.json",
 ];
 
@@ -84,6 +85,144 @@ const CASES = [
     mutate: edit(".cogni/repo-policy.json", '"manifest"]', '"manifest", "nonexistent-check"]'),
     expectExit: 1,
     expectMatch: /required check "nonexistent-check"/,
+  },
+  {
+    name: "a --clobber in the publish lane makes a published version mutable",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      'gh release create "$GITHUB_REF_NAME" "${{ steps.pack.outputs.tgz }}" \\',
+      'gh release upload "$GITHUB_REF_NAME" "${{ steps.pack.outputs.tgz }}" --clobber \\'
+    ),
+    expectExit: 1,
+    expectMatch: /uses --clobber/,
+  },
+  {
+    name: "a continue-on-error publish step cannot fail, so it proves nothing",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      "      - name: Attach the tarball to a Release\n        if: github.event_name == 'push'",
+      "      - name: Attach the tarball to a Release\n        continue-on-error: true\n        if: github.event_name == 'push'"
+    ),
+    expectExit: 1,
+    expectMatch: /continue-on-error/,
+  },
+  {
+    name: "an ungated release step lets workflow_dispatch publish without a tag",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      "      - name: Attach the tarball to a Release\n        if: github.event_name == 'push'\n",
+      "      - name: Attach the tarball to a Release\n"
+    ),
+    expectExit: 1,
+    expectMatch: /publishes or attests but is not gated/,
+  },
+  {
+    name: "deleting the required-checks gate lets an ungated commit be published",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      "      - name: Tagged commit must have passed every required check",
+      "      - name: Tagged commit checks are assumed green"
+    ),
+    expectExit: 1,
+    expectMatch: /Tagged commit must have passed every required check/,
+  },
+  {
+    name: "re-adding packages: write signals a second, unreachable distribution channel",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      "  id-token: write\n  attestations: write",
+      "  id-token: write\n  attestations: write\n  packages: write"
+    ),
+    expectExit: 1,
+    expectMatch: /permissions\.packages must not be granted/,
+  },
+  {
+    name: "building the artifact on a different Node major than CI gates it",
+    mutate: edit(".github/workflows/publish-packages.yml", 'NODE_VERSION: "22"', 'NODE_VERSION: "24"'),
+    expectExit: 1,
+    expectMatch: /env\.NODE_VERSION must match/,
+  },
+  // The registry <-> tag-filter bijection. Drift in EITHER direction is silent at
+  // author time and only surfaces once a tag has been pushed, which is too late.
+  {
+    name: "a registered package with no tag filter can never be published",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      '      - "knowledge-store-v*"\n',
+      ""
+    ),
+    expectExit: 1,
+    expectMatch: /must include the tag filter "knowledge-store-v\*"/,
+  },
+  {
+    name: "a tag filter with no registry entry fires a run that selects nothing",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      '      - "knowledge-base-v*"\n',
+      '      - "knowledge-base-v*"\n      - "node-core-v*"\n'
+    ),
+    expectExit: 1,
+    expectMatch: /tag filter "node-core-v\*" matches no env\.PACKAGES entry/,
+  },
+  {
+    name: "deleting a registry entry while its tag filter remains is rejected",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      '"knowledge-store-v"},\n     {"name":"@cogni-dao/knowledge-base","dir":"packages/knowledge-base","tagPrefix":"knowledge-base-v"}]',
+      '"knowledge-store-v"}]'
+    ),
+    expectExit: 1,
+    expectMatch: /tag filter "knowledge-base-v\*" matches no env\.PACKAGES entry/,
+  },
+  {
+    name: "an unparseable registry is rejected rather than silently skipped",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      '  PACKAGES: >-\n',
+      '  PACKAGES: "not json"\n  PACKAGES_OLD: >-\n'
+    ),
+    expectExit: 1,
+    expectMatch: /env\.PACKAGES must be valid JSON/,
+  },
+  {
+    name: "a registry entry missing its dir cannot locate the package to pack",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      '{"name":"@cogni-dao/work-items","dir":"packages/work-items","tagPrefix":"work-items-v"}',
+      '{"name":"@cogni-dao/work-items","tagPrefix":"work-items-v"}'
+    ),
+    expectExit: 1,
+    expectMatch: /env\.PACKAGES\[0\] must declare a non-empty string "dir"/,
+  },
+  {
+    name: "a static matrix replaces the derived one, and matrix is not available in jobs.<id>.if",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      "        pkg: ${{ fromJSON(needs.select.outputs.packages) }}",
+      '        pkg:\n          - {"name":"@cogni-dao/work-items","dir":"packages/work-items","tagPrefix":"work-items-v"}'
+    ),
+    expectExit: 1,
+    expectMatch: /matrix\.pkg must be derived from jobs\.select/,
+  },
+  {
+    name: "dropping jobs.select removes the thing that narrows a tag to one package",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      "  select:\n    runs-on: ubuntu-latest\n    outputs:\n      packages: ${{ steps.select.outputs.packages }}\n",
+      "  select:\n    runs-on: ubuntu-latest\n"
+    ),
+    expectExit: 1,
+    expectMatch: /jobs\.select must expose a non-empty `packages` output/,
+  },
+  {
+    name: "publish must not run without select, or the matrix resolves to nothing",
+    mutate: edit(
+      ".github/workflows/publish-packages.yml",
+      "  publish:\n    needs: select\n",
+      "  publish:\n"
+    ),
+    expectExit: 1,
+    expectMatch: /jobs\.publish\.needs must include "select"/,
   },
 ];
 
