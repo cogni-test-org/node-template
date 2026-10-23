@@ -6,6 +6,10 @@ const PR_BUILD_WORKFLOW_PATH = ".github/workflows/pr-build.yml";
 const PR_LINT_WORKFLOW_PATH = ".github/workflows/pr-lint.yaml";
 const PUBLISH_WORKFLOW_PATH = ".github/workflows/publish-packages.yml";
 const REPO_POLICY_PATH = ".cogni/repo-policy.json";
+const CONTRACT_INSTALL_COMMAND =
+  "pnpm --filter @cogni/repo-spec... install --frozen-lockfile --ignore-scripts --config.dedupe-peer-dependents=false";
+const MAIN_CACHE_EXPORT =
+  "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=node-template-{0}', matrix.target.artifact) || '' }}";
 
 const ciWorkflow = readWorkflow(CI_WORKFLOW_PATH);
 const prBuildWorkflow = readWorkflow(PR_BUILD_WORKFLOW_PATH);
@@ -46,6 +50,23 @@ function expectStep(path, steps, name) {
   const step = steps.find((candidate) => candidate?.name === name);
   if (!step) fail(path, `steps must include ${JSON.stringify(name)}`);
   return step;
+}
+
+// These jobs consume one contract; required CI owns the full app/test closure.
+function expectContractInstall(steps, jobName) {
+  const install = expectStep(PR_BUILD_WORKFLOW_PATH, steps, "Install");
+  expectEqual(
+    PR_BUILD_WORKFLOW_PATH,
+    install?.run,
+    CONTRACT_INSTALL_COMMAND,
+    `${jobName} frozen contract install`
+  );
+  const node = expectStep(PR_BUILD_WORKFLOW_PATH, steps, "Set up Node");
+  for (const key of ["cache", "cache-dependency-path"]) {
+    if (Object.hasOwn(node?.with ?? {}, key)) {
+      fail(PR_BUILD_WORKFLOW_PATH, `${jobName} must not hydrate a broad Node cache`);
+    }
+  }
 }
 
 function expectTrigger(path, workflow, trigger) {
@@ -228,8 +249,14 @@ if (!staticJob) fail(CI_WORKFLOW_PATH, "jobs must include static");
 const staticSteps = Array.isArray(staticJob?.steps) ? staticJob.steps : [];
 expectStep(CI_WORKFLOW_PATH, staticSteps, "Install dependencies");
 expectStep(CI_WORKFLOW_PATH, staticSteps, "Build workspace packages");
-expectStep(CI_WORKFLOW_PATH, staticSteps, "Type check");
-expectStep(CI_WORKFLOW_PATH, staticSteps, "Workflow contract check");
+for (const [name, command] of [
+  ["Database schema checks", "pnpm db:check"],
+  ["Type check", "pnpm typecheck"],
+  ["Workflow contract check", "pnpm check:workflow"],
+]) {
+  const step = expectStep(CI_WORKFLOW_PATH, staticSteps, name);
+  expectEqual(CI_WORKFLOW_PATH, step?.run, command, `static ${name} command`);
+}
 
 const unitJob = ciWorkflow?.jobs?.unit;
 if (!unitJob) fail(CI_WORKFLOW_PATH, "jobs must include unit");
@@ -245,7 +272,17 @@ if (Object.hasOwn(unitJob, "needs")) {
 const unitSteps = Array.isArray(unitJob?.steps) ? unitJob.steps : [];
 expectStep(CI_WORKFLOW_PATH, unitSteps, "Install dependencies");
 expectStep(CI_WORKFLOW_PATH, unitSteps, "Build workspace packages");
-expectStep(CI_WORKFLOW_PATH, unitSteps, "Unit + contract coverage tests");
+const unitTestStep = expectStep(
+  CI_WORKFLOW_PATH,
+  unitSteps,
+  "Unit + contract coverage tests"
+);
+expectEqual(
+  CI_WORKFLOW_PATH,
+  unitTestStep?.run,
+  "pnpm test:ci",
+  "unit test command"
+);
 
 expectEqual(PR_BUILD_WORKFLOW_PATH, prBuildWorkflow?.name, "PR Build", "workflow name");
 expectTrigger(PR_BUILD_WORKFLOW_PATH, prBuildWorkflow, "pull_request");
@@ -294,7 +331,32 @@ const detectJob = prBuildWorkflow?.jobs?.detect;
 if (!detectJob) fail(PR_BUILD_WORKFLOW_PATH, "jobs must include detect");
 expectEqual(PR_BUILD_WORKFLOW_PATH, detectJob?.needs, "resolve", "jobs.detect.needs");
 const detectSteps = Array.isArray(detectJob?.steps) ? detectJob.steps : [];
-expectStep(PR_BUILD_WORKFLOW_PATH, detectSteps, "Typecheck package closure");
+expectContractInstall(detectSteps, "detect");
+const detectBuildStep = expectStep(
+  PR_BUILD_WORKFLOW_PATH,
+  detectSteps,
+  "Build repo-spec contract"
+);
+expectEqual(
+  PR_BUILD_WORKFLOW_PATH,
+  detectBuildStep?.run,
+  "pnpm --filter @cogni/repo-spec build",
+  "detect dependency build"
+);
+// The image path consumes a build contract; ci.yaml owns verification. Catch
+// reintroducing the duplicated full check/test gate under a different step name.
+for (const step of detectSteps) {
+  if (
+    /\bpnpm\s+(?:run\s+)?(?:check(?::[\w:-]+)?|test(?::[\w:-]+)?|typecheck|db:check)(?=\s|$|[;&|])/.test(
+      String(step?.run ?? "")
+    )
+  ) {
+    fail(
+      PR_BUILD_WORKFLOW_PATH,
+      "jobs.detect must not duplicate CI checks or tests"
+    );
+  }
+}
 expectStep(PR_BUILD_WORKFLOW_PATH, detectSteps, "Detect node image targets");
 
 const buildJob = prBuildWorkflow?.jobs?.build;
@@ -304,9 +366,19 @@ if (!Array.isArray(buildJob?.needs) || buildJob.needs.join(",") !== "resolve,det
 }
 expectEqual(PR_BUILD_WORKFLOW_PATH, buildJob?.strategy?.["fail-fast"], false, "jobs.build.strategy.fail-fast");
 const buildSteps = Array.isArray(buildJob?.steps) ? buildJob.steps : [];
+// Omitting Buildx teardown is bounded to this disposable GitHub-hosted job.
+expectEqual(PR_BUILD_WORKFLOW_PATH, buildJob?.["runs-on"], "ubuntu-latest", "ephemeral image runner");
+const buildxStep = expectStep(PR_BUILD_WORKFLOW_PATH, buildSteps, "Set up Docker Buildx");
+expectEqual(PR_BUILD_WORKFLOW_PATH, buildxStep?.with?.cleanup, false, "ephemeral Buildx cleanup");
 expectStep(PR_BUILD_WORKFLOW_PATH, buildSteps, "Checkout");
 expectStep(PR_BUILD_WORKFLOW_PATH, buildSteps, "Login to GHCR");
 const imageBuildStep = expectStep(PR_BUILD_WORKFLOW_PATH, buildSteps, "Build app image");
+expectEqual(
+  PR_BUILD_WORKFLOW_PATH,
+  imageBuildStep?.with?.["cache-to"],
+  MAIN_CACHE_EXPORT,
+  "trusted main cache export"
+);
 expectEqual(
   PR_BUILD_WORKFLOW_PATH,
   imageBuildStep?.with?.context,
@@ -328,6 +400,7 @@ if (!Array.isArray(manifestJob?.needs) || manifestJob.needs.join(",") !== "resol
   fail(PR_BUILD_WORKFLOW_PATH, "jobs.manifest.needs must be [\"resolve\", \"detect\", \"build\"]");
 }
 const manifestSteps = Array.isArray(manifestJob?.steps) ? manifestJob.steps : [];
+expectContractInstall(manifestSteps, "manifest");
 expectStep(PR_BUILD_WORKFLOW_PATH, manifestSteps, "Download build fragments");
 expectStep(PR_BUILD_WORKFLOW_PATH, manifestSteps, "Build repo-spec contract");
 const setupOrasStep = expectStep(PR_BUILD_WORKFLOW_PATH, manifestSteps, "Set up ORAS");
