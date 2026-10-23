@@ -9,15 +9,13 @@ import { KnowledgeUseWhen } from "../src/index.js";
 afterEach(cleanup);
 
 describe("KnowledgeUseWhen", () => {
-  it.each([
-    undefined,
-    null,
-    "",
-    " \n\t ",
-  ])("omits an absent or blank trigger (%j)", (useWhen) => {
-    const { container } = render(<KnowledgeUseWhen useWhen={useWhen} />);
-    expect(container).toBeEmptyDOMElement();
-  });
+  it.each([undefined, null, "", " \n\t "])(
+    "omits an absent or blank trigger (%j)",
+    (useWhen) => {
+      const { container } = render(<KnowledgeUseWhen useWhen={useWhen} />);
+      expect(container).toBeEmptyDOMElement();
+    }
+  );
 
   it("trims the trigger and leaves styling with the caller", () => {
     const { container } = render(
@@ -28,7 +26,7 @@ describe("KnowledgeUseWhen", () => {
     );
 
     expect(container.querySelector("p")).toHaveTextContent(
-      /^Use when: reviewing deployment evidence$/
+      /^Use when \(TEST P1\): reviewing deployment evidence$/
     );
     expect(container.querySelector("p")).toHaveClass("node-subtitle");
   });
@@ -39,7 +37,7 @@ describe("KnowledgeUseWhen", () => {
 
     expect(
       screen.getByText((_, element) => element?.tagName === "P")
-    ).toHaveTextContent(`Use when: ${trigger}`);
+    ).toHaveTextContent(`Use when (TEST P1): ${trigger}`);
     expect(container.querySelector("img, script, strong")).toBeNull();
   });
 
@@ -47,7 +45,7 @@ describe("KnowledgeUseWhen", () => {
     const { container, rerender } = render(
       <KnowledgeUseWhen useWhen="reviewing a repair" />
     );
-    expect(screen.getByText("Use when:")).toBeInTheDocument();
+    expect(screen.getByText("Use when (TEST P1):")).toBeInTheDocument();
 
     rerender(<KnowledgeUseWhen />);
     expect(container).toBeEmptyDOMElement();

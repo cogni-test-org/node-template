@@ -258,34 +258,12 @@ test("actual TEST seed condition excludes PR, main, dispatch and foreign repos",
   assert.deepEqual(build.on.push.branches, ["main", BRANCH]);
 });
 
-test("actual cache export expression writes only main or exact real TEST seed push", () => {
+test("actual control retains original private PR cache export policy", () => {
   const step = build.jobs.build.steps.find((step) =>
     step.uses?.startsWith("docker/build-push-action@")
   );
-  const expression = step.with["cache-to"]
-    .replace(/^\$\{\{\s*/, "")
-    .replace(/\s*\}\}$/, "");
-  const github = {
-    repository: REPOSITORY,
-    event_name: "push",
-    ref: `refs/heads/${BRANCH}`,
-  };
-  const evaluate = (value) =>
-    runInNewContext(expression, {
-      github: value,
-      matrix: { target: { artifact: "app" } },
-      format: (template, argument) => template.replace("{0}", argument),
-    });
-  assert.equal(evaluate(github), "type=gha,mode=max,scope=node-template-app");
   assert.equal(
-    evaluate({ ...github, ref: "refs/heads/main" }),
-    "type=gha,mode=max,scope=node-template-app"
+    step.with["cache-to"],
+    "type=gha,mode=max,scope=node-template-${{ matrix.target.artifact }}"
   );
-  for (const change of [
-    { event_name: "pull_request" },
-    { event_name: "workflow_dispatch" },
-    { repository: "cogni-dao/node-template" },
-    { ref: "refs/heads/test/foreign" },
-  ])
-    assert.equal(evaluate({ ...github, ...change }), "");
 });
