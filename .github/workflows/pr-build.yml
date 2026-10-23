@@ -4,7 +4,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main]
+    branches: [main, test/task5315-trusted-cache-current-821dc]
   # Operator-dispatched TRUSTED build of an approved PR head — MONOREPO PARITY
   # (bug.5057). A fork PR's `pull_request` run is read-only and cannot push the
   # image (should_push=false). The operator (POST /api/v1/vcs/run-ci →
@@ -50,6 +50,19 @@ jobs:
       should_push: ${{ steps.r.outputs.should_push }}
       ref_name: ${{ steps.r.outputs.ref_name }}
     steps:
+      - name: Checkout TEST cache seed for protection admission
+        if: github.repository == 'cogni-test-org/node-template' && github.event_name == 'push' && github.ref == 'refs/heads/test/task5315-trusted-cache-current-821dc'
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+        with:
+          ref: ${{ github.sha }}
+
+      # TEST-only: no cache action/POST may register before this branch is protected.
+      - name: Admit protected TEST cache base
+        if: github.repository == 'cogni-test-org/node-template' && github.event_name == 'push' && github.ref == 'refs/heads/test/task5315-trusted-cache-current-821dc'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/assert-test-cache-base-protection.mjs
+
       - name: Resolve source metadata
         id: r
         env:
@@ -268,7 +281,7 @@ jobs:
           build-args: |
             BUILD_SHA=${{ needs.resolve.outputs.source_sha }}
           cache-from: type=gha,scope=node-template-${{ matrix.target.artifact }}
-          cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=node-template-{0}', matrix.target.artifact) || '' }}
+          cache-to: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || (github.repository == 'cogni-test-org/node-template' && github.ref == 'refs/heads/test/task5315-trusted-cache-current-821dc')) && format('type=gha,mode=max,scope=node-template-{0}', matrix.target.artifact) || '' }}
 
       - name: Write build fragment
         env:

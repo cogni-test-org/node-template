@@ -4,7 +4,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main]
+    branches: [main, test/task5315-trusted-cache-current-821dc]
 
 permissions:
   contents: read
@@ -32,6 +32,13 @@ jobs:
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
 
+      # TEST-only: no cache action/POST may register before this branch is protected.
+      - name: Admit protected TEST cache base
+        if: github.repository == 'cogni-test-org/node-template' && github.event_name == 'push' && github.ref == 'refs/heads/test/task5315-trusted-cache-current-821dc'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/assert-test-cache-base-protection.mjs
+
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -41,6 +48,10 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Verify TEST cache protection qualification
+        if: github.repository == 'cogni-test-org/node-template'
+        run: node --test scripts/ci/tests/test-cache-base-protection.test.mjs
 
       - name: Install pinned Foundry
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
@@ -77,6 +88,13 @@ jobs:
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
 
+      # TEST-only: no cache action/POST may register before this branch is protected.
+      - name: Admit protected TEST cache base
+        if: github.repository == 'cogni-test-org/node-template' && github.event_name == 'push' && github.ref == 'refs/heads/test/task5315-trusted-cache-current-821dc'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/assert-test-cache-base-protection.mjs
+
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -101,6 +119,13 @@ jobs:
     # artifact with static; running in parallel keeps it off the critical path.
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+
+      # TEST-only: no cache action/POST may register before this branch is protected.
+      - name: Admit protected TEST cache base
+        if: github.repository == 'cogni-test-org/node-template' && github.event_name == 'push' && github.ref == 'refs/heads/test/task5315-trusted-cache-current-821dc'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/assert-test-cache-base-protection.mjs
 
       - uses: pnpm/action-setup@c5ba7f7862a0f64c1b1a05fbac13e0b8e86ba08c # v4
 
