@@ -33,6 +33,9 @@ const manrope = Manrope({
   subsets: ["latin"],
 });
 
+// TEST-only deliberate parser failure; never merge or deploy this fixture.
+const intentionalTemplateCompileFailure = ;
+
 export const metadata: Metadata = {
   title: "Cogni",
   description: "Web3 Gov + Web2 AI",
