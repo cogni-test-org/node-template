@@ -186,7 +186,7 @@ jobs:
           const sourceRoot = process.env.NODE_BUILD_SOURCE_ROOT;
           const negativeRoot = process.env.NODE_BUILD_NEGATIVE_ROOT;
           const spec = parseRepoSpec(readFileSync(".cogni/repo-spec.yaml", "utf8"));
-          spec.deployment.services = [];
+          spec.deployment = { services: [] };
           mkdirSync(join(negativeRoot, ".cogni"));
           const specFile = join(negativeRoot, ".cogni/repo-spec.yaml");
           writeFileSync(specFile, JSON.stringify(spec));
