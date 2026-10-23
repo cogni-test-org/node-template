@@ -282,7 +282,7 @@ jobs:
           IMAGE_NAME: ${{ matrix.target.image_name }}
           IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
-          DIGEST: ${{ steps.image.outputs.digest }}
+          DIGEST: '' # TEST-only simulation of a publisher with no digest output
           REPOSITORY: ${{ github.repository }}
         run: node scripts/ci/write-node-build-fragment.mjs
 
@@ -382,6 +382,17 @@ jobs:
           path: ${{ runner.temp }}/build-fragments
           pattern: pr-build-fragment-*-${{ needs.resolve.outputs.source_sha }}
           merge-multiple: true
+
+      - name: Qualify empty fragments and actual trust boundaries
+        env:
+          FRAGMENTS_DIR: ${{ runner.temp }}/build-fragments
+          IMAGE_NAME: ${{ needs.resolve.outputs.image_name }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY: ${{ needs.resolve.outputs.checkout_repo }}
+          EMIT_BUNDLE: ${{ needs.resolve.outputs.should_push }}
+        run: node scripts/ci/qualify-template-artifact-failures.mjs
 
       - name: Write build manifest
         env:
