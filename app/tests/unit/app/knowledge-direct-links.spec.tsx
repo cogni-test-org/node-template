@@ -109,39 +109,39 @@ describe("ordinary knowledge reads", () => {
     { label: "null", useWhen: null, expected: null },
     { label: "empty", useWhen: "", expected: null },
     { label: "whitespace", useWhen: " \n\t ", expected: null },
-  ])("renders a $label retrieval trigger without another read", async ({
-    useWhen,
-    expected,
-  }) => {
-    const fetchMock = vi.fn(async (input: string) => {
-      if (input === "/api/v1/knowledge/root")
-        return Response.json(body(useWhen));
-      if (input === "/api/v1/citations/root") {
-        return Response.json({ links: [], nextCursor: null });
+  ])(
+    "renders a $label retrieval trigger without another read",
+    async ({ useWhen, expected }) => {
+      const fetchMock = vi.fn(async (input: string) => {
+        if (input === "/api/v1/knowledge/root")
+          return Response.json(body(useWhen));
+        if (input === "/api/v1/citations/root") {
+          return Response.json({ links: [], nextCursor: null });
+        }
+        throw new Error(`Unexpected read: ${input}`);
+      });
+      mount(fetchMock);
+      const heading = await screen.findByRole("heading", {
+        level: 1,
+        name: "Root atom",
+      });
+      const subtitle = heading.nextElementSibling;
+      if (expected === null) {
+        expect(subtitle?.tagName).toBe("DIV");
+      } else {
+        expect(subtitle?.tagName).toBe("P");
+        expect(subtitle?.textContent).toBe(`Use when (TEST P2): ${expected}`);
+        expect(subtitle?.querySelector("strong")).toBeNull();
       }
-      throw new Error(`Unexpected read: ${input}`);
-    });
-    mount(fetchMock);
-    const heading = await screen.findByRole("heading", {
-      level: 1,
-      name: "Root atom",
-    });
-    const subtitle = heading.nextElementSibling;
-    if (expected === null) {
-      expect(subtitle?.tagName).toBe("DIV");
-    } else {
-      expect(subtitle?.tagName).toBe("P");
-      expect(subtitle?.textContent).toBe(`Use when: ${expected}`);
-      expect(subtitle?.querySelector("strong")).toBeNull();
+      expect(screen.getByText("Only the selected atom body")).toBeTruthy();
+      await waitFor(() =>
+        expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+          "/api/v1/knowledge/root",
+          "/api/v1/citations/root",
+        ])
+      );
     }
-    expect(screen.getByText("Only the selected atom body")).toBeTruthy();
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-        "/api/v1/knowledge/root",
-        "/api/v1/citations/root",
-      ])
-    );
-  });
+  );
 
   it("fetches one body and five direct links, then fetches more only after a click", async () => {
     const fetchMock = vi.fn(async (input: string) => {
