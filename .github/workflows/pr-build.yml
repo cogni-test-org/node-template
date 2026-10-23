@@ -148,9 +148,11 @@ jobs:
           node scripts/ci/verify-repo-spec-frozen-negative.mjs
 
       - name: Install
+        run: pnpm --filter @cogni/repo-spec... install --frozen-lockfile --ignore-scripts --config.dedupe-peer-dependents=false
+
+      - name: Report TEST contract closure and verify unchanged inputs
         run: |
           set -euo pipefail
-          pnpm --filter @cogni/repo-spec... install --frozen-lockfile --ignore-scripts --config.dedupe-peer-dependents=false
           node -e 'const fs = require("node:fs"); const root = JSON.parse(fs.readFileSync("package.json", "utf8")); const spec = JSON.parse(fs.readFileSync("packages/repo-spec/package.json", "utf8")); console.log(JSON.stringify({ rootDevDependencies: Object.keys(root.devDependencies), rootDependencies: Object.keys(root.dependencies ?? {}), contractDependencies: Object.keys(spec.dependencies), installedPackageDirectories: fs.readdirSync("node_modules/.pnpm", { withFileTypes: true }).filter(entry => entry.isDirectory()).length }));'
           du -sk node_modules "$(pnpm store path --silent)"
           node scripts/ci/verify-repo-spec-frozen-negative.mjs --verify-inputs-only
@@ -349,9 +351,11 @@ jobs:
           node scripts/ci/verify-repo-spec-frozen-negative.mjs
 
       - name: Install
+        run: pnpm --filter @cogni/repo-spec... install --frozen-lockfile --ignore-scripts --config.dedupe-peer-dependents=false
+
+      - name: Report TEST contract closure and verify unchanged inputs
         run: |
           set -euo pipefail
-          pnpm --filter @cogni/repo-spec... install --frozen-lockfile --ignore-scripts --config.dedupe-peer-dependents=false
           node -e 'const fs = require("node:fs"); const root = JSON.parse(fs.readFileSync("package.json", "utf8")); const spec = JSON.parse(fs.readFileSync("packages/repo-spec/package.json", "utf8")); console.log(JSON.stringify({ rootDevDependencies: Object.keys(root.devDependencies), rootDependencies: Object.keys(root.dependencies ?? {}), contractDependencies: Object.keys(spec.dependencies), installedPackageDirectories: fs.readdirSync("node_modules/.pnpm", { withFileTypes: true }).filter(entry => entry.isDirectory()).length }));'
           du -sk node_modules "$(pnpm store path --silent)"
           node scripts/ci/verify-repo-spec-frozen-negative.mjs --verify-inputs-only
