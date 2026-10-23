@@ -28,7 +28,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-// Exact reviewed821dc metadata; no old fixture manifest or source tree fallback.
+// Reviewed821dc metadata plus declared TEST YAML2.9.1; no fixture fallback.
 const INPUTS = [
   {
     path: "app/package.json",
@@ -40,7 +40,7 @@ const INPUTS = [
   },
   {
     path: "package.json",
-    blob: "16d6dc2c1981d2248cef9a3d96c34bfb1ae0fe72",
+    blob: "b9e6acaeea495309c662e3d16d45c5475be5f001",
   },
   {
     path: "packages/ai-core/package.json",
@@ -156,7 +156,7 @@ const INPUTS = [
   },
   {
     path: "packages/repo-spec/package.json",
-    blob: "d26833d1119434b39507b0d084a4f1af6a6cffcf",
+    blob: "ea4fe255429844b41a98295edf7223264f1c344c",
   },
   {
     path: "packages/scheduler-core/package.json",
@@ -168,7 +168,7 @@ const INPUTS = [
   },
   {
     path: "pnpm-lock.yaml",
-    blob: "37c0131f49d9e2254bbb4b90a55ee96112ada6df",
+    blob: "7a942435b6eed5550c074ff81f449e54e3c7a806",
   },
   {
     path: "pnpm-workspace.yaml",
