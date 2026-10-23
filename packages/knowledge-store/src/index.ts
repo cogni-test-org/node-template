@@ -38,10 +38,15 @@ export {
   ContributionRecordSchema,
   type ContributionState,
   ContributionStateSchema,
+  KNOWLEDGE_ENTRY_PATCH_FIELDS,
   type KnowledgeContributionEdit,
   KnowledgeContributionEditSchema,
+  KnowledgeEntryIdSchema,
   type KnowledgeEntryInput,
   KnowledgeEntryInputSchema,
+  type KnowledgeEntryPatch,
+  KnowledgeEntryPatchSchema,
+  knowledgeEntryPatchIsEmpty,
   type Principal,
   type PrincipalKind,
   PrincipalKindSchema,
@@ -162,6 +167,7 @@ export {
   type CreateEdoDecisionInput,
   type CreateEdoHypothesisInput,
   type CreateEdoOutcomeInput,
+  EmptyKnowledgePatchError,
   type KnowledgeContributionPort,
 } from "./port/contribution.port.js";
 // EDO resolver port (hypothesis loop)
@@ -177,6 +183,8 @@ export type {
 } from "./port/edo-resolver.port.js";
 // Port interfaces + domain-registry types/errors
 export {
+  type CitationLinkPage,
+  type CitationLinkSummary,
   CitationTargetNotFoundError,
   CitationTypeMismatchError,
   type Domain,

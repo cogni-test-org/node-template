@@ -18,7 +18,14 @@
  *     against stale metadata before recording the next sequence number.
  *   - try/finally restores dolt_checkout('main') and releases the connection on error.
  *   - knowledge_contributions metadata table on main tracks state/principal/idempotency.
+ *   - IDEMPOTENCY_CHECK_INSIDE_ADMISSION: create replays are resolved only
+ *     after the cross-replica write lock, so concurrent retries cannot both
+ *     create branches before the unique metadata row is visible.
+ *   - APPEND_HEAD_READ_INSIDE_ADMISSION: append metadata is read under the
+ *     same lock as the branch write; queued appends observe their predecessor.
  *   - Reads from a branch use reserved-conn checkout (AS OF deferred to v1).
+ *   - PATCH_CARRIES_ONLY_UNGATED_FIELDS: `patch` can change only `useWhen`
+ *     and `entryType`, never content or any gate-governed field.
  *   - EDO atomic-batch methods (createEdoHypothesis/Decision/Outcome) open a
  *     contrib branch and apply entry + N citations + (for outcomes) confidence
  *     recompute in one Dolt commit on the branch. Mirrors EdoCapability's
@@ -40,7 +47,12 @@ import type {
   ContributionRecord,
   ContributionState,
   KnowledgeContributionEdit,
+  KnowledgeEntryPatch,
   Principal,
+} from "../../domain/contribution-schemas.js";
+import {
+  KNOWLEDGE_ENTRY_PATCH_FIELDS,
+  knowledgeEntryPatchIsEmpty,
 } from "../../domain/contribution-schemas.js";
 import type { CitationType } from "../../domain/schemas.js";
 import {
@@ -54,6 +66,7 @@ import {
   type CreateEdoDecisionInput,
   type CreateEdoHypothesisInput,
   type CreateEdoOutcomeInput,
+  EmptyKnowledgePatchError,
   type KnowledgeContributionPort,
 } from "../../port/contribution.port.js";
 import {
@@ -66,7 +79,13 @@ import {
   type BranchSessionOptions,
   DoltBranchSessionRunner,
 } from "./session-admission.js";
-import { assertDomainRegistered, escapeRef, escapeValue } from "./util.js";
+import {
+  assertDomainRegistered,
+  escapeRef,
+  escapeValue,
+  type SqlColumnValue,
+  updateSetSql,
+} from "./util.js";
 
 function principalSlug(p: Principal): string {
   return (p.name ?? p.id)
@@ -232,6 +251,38 @@ async function currentHash(conn: ReservedSql, ref: string): Promise<string> {
     `SELECT dolt_hashof(${escapeRef(ref)}) AS dolt_hashof`
   );
   return parseDoltResult(rows[0] as Record<string, unknown>, "dolt_hashof");
+}
+
+/** Contribution branches may predate the additive use_when migration. */
+async function knowledgeColumnExists(
+  conn: ReservedSql,
+  columnName: string
+): Promise<boolean> {
+  const rows = await conn.unsafe(
+    `SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'knowledge' AND column_name = ${escapeValue(columnName)} LIMIT 1`
+  );
+  return rows.length > 0;
+}
+
+/** Build the branch-scoped SET for the two fields a patch may carry. */
+function knowledgePatchColumns(
+  patch: KnowledgeEntryPatch,
+  provenance: { sourceRef: string; sourceNode: string }
+): SqlColumnValue[] {
+  const columns: SqlColumnValue[] = [];
+  if (patch.useWhen !== undefined) {
+    columns.push({
+      column: "use_when",
+      value: patch.useWhen,
+    });
+  }
+  if (patch.entryType !== undefined) {
+    columns.push({ column: "entry_type", value: patch.entryType });
+  }
+  columns.push({ column: "source_type", value: "external" });
+  columns.push({ column: "source_ref", value: provenance.sourceRef });
+  columns.push({ column: "source_node", value: provenance.sourceNode });
+  return columns;
 }
 
 async function assertKnowledgeRowExists(
@@ -552,6 +603,34 @@ async function applyEdit(input: {
     return;
   }
 
+  if (edit.op === "uncite") {
+    const existing = (await conn.unsafe(
+      `SELECT cited_id FROM citations WHERE citing_id = ${escapeValue(edit.citingId)} AND cited_id = ${escapeValue(edit.citedId)} AND citation_type = ${escapeValue(edit.citationType)} LIMIT 1`
+    )) as Array<{ cited_id: string }>;
+    if (existing.length === 0) {
+      throw new ContributionConflictError(
+        `citation edge not found: '${edit.citingId}' -[${edit.citationType}]-> '${edit.citedId}'`
+      );
+    }
+    await conn.unsafe(
+      `DELETE FROM citations WHERE citing_id = ${escapeValue(edit.citingId)} AND cited_id = ${escapeValue(edit.citedId)} AND citation_type = ${escapeValue(edit.citationType)}`
+    );
+
+    // supports/contradicts affect the cited atom's confidence. Recompute only
+    // when that atom exists on the contribution branch; cross-plane work-item
+    // edges and main-only endpoints have no branch knowledge row to update.
+    if (
+      edit.citationType !== "tracks" &&
+      (edit.citationType === "supports" || edit.citationType === "contradicts")
+    ) {
+      const cited = await resolveCitationEndpoint(conn, mainSql, edit.citedId);
+      if (cited?.kind === "knowledge" && cited.onBranch) {
+        await recomputeConfidenceOnConn(conn, edit.citedId);
+      }
+    }
+    return;
+  }
+
   if (edit.op === "cite") {
     const citing = await resolveCitationEndpoint(conn, mainSql, edit.citingId);
     if (citing === null) {
@@ -605,18 +684,26 @@ async function applyEdit(input: {
     return;
   }
 
-  await assertDomainRegistered(conn, edit.entry.domain);
-  const confidencePct = initializeConfidence(
-    {
-      sourceType: "external",
-    },
-    { principalKind: principal.kind }
-  ).confidencePct;
-  if (edit.op === "update") {
+  if (edit.op === "patch") {
     await assertKnowledgeRowExists(conn, edit.targetRowId);
-    const entryType = edit.entry.entryType ?? "finding";
+    if (knowledgeEntryPatchIsEmpty(edit.entry)) {
+      throw new EmptyKnowledgePatchError(edit.targetRowId, [
+        ...KNOWLEDGE_ENTRY_PATCH_FIELDS,
+      ]);
+    }
+    if (
+      edit.entry.useWhen !== undefined &&
+      !(await knowledgeColumnExists(conn, "use_when"))
+    ) {
+      throw new ContributionConflictError(
+        "cannot patch use_when: the knowledge table on this branch has no use_when column"
+      );
+    }
+    const setClauses = updateSetSql(
+      knowledgePatchColumns(edit.entry, { sourceRef: ref, sourceNode })
+    );
     const result = await conn.unsafe(
-      `UPDATE knowledge SET domain = ${escapeValue(edit.entry.domain)}, entity_id = ${escapeValue(edit.entry.entityId ?? null)}, title = ${escapeValue(edit.entry.title)}, content = ${escapeValue(edit.entry.content)}, entry_type = ${escapeValue(entryType)}, confidence_pct = ${escapeValue(confidencePct)}, source_type = ${escapeValue("external")}, source_ref = ${escapeValue(ref)}, source_node = ${escapeValue(sourceNode)}, tags = ${edit.entry.tags ? escapeValue(edit.entry.tags) : "NULL"}, updated_at = now() WHERE id = ${escapeValue(edit.targetRowId)}`
+      `UPDATE knowledge SET ${setClauses}, updated_at = now() WHERE id = ${escapeValue(edit.targetRowId)}`
     );
     if (result.count === 0) {
       throw new ContributionNotFoundError(
@@ -626,17 +713,39 @@ async function applyEdit(input: {
     return;
   }
 
-  // Server-stamped fallback id uses `-` not `:` so the result satisfies the
-  // v0 shape gate (kebab only). The contribution prefix is still long; this
-  // is a transitional concession — clients SHOULD supply `entry.id`
-  // explicitly per the syntropy expert decision tree (write atomic with a
-  // sharp slug). Auto-stamps will be removed once the UI form enforces
-  // explicit ids (P0.6.v0b).
-  const entryId =
-    edit.entry.id ?? `${contributionId}-${randomBytes(3).toString("hex")}`;
+  await assertDomainRegistered(conn, edit.entry.domain);
+  const hasUseWhen = await knowledgeColumnExists(conn, "use_when");
+  const confidencePct = initializeConfidence(
+    {
+      sourceType: "external",
+    },
+    { principalKind: principal.kind }
+  ).confidencePct;
+  if (edit.op === "update") {
+    await assertKnowledgeRowExists(conn, edit.targetRowId);
+    const entryType = edit.entry.entryType ?? "finding";
+    const useWhenAssignment = hasUseWhen
+      ? `, use_when = ${edit.entry.useWhen ? escapeValue(edit.entry.useWhen) : "NULL"}`
+      : "";
+    const result = await conn.unsafe(
+      `UPDATE knowledge SET domain = ${escapeValue(edit.entry.domain)}, entity_id = ${escapeValue(edit.entry.entityId ?? null)}, title = ${escapeValue(edit.entry.title)}, content = ${escapeValue(edit.entry.content)}${useWhenAssignment}, entry_type = ${escapeValue(entryType)}, confidence_pct = ${escapeValue(confidencePct)}, source_type = ${escapeValue("external")}, source_ref = ${escapeValue(ref)}, source_node = ${escapeValue(sourceNode)}, tags = ${edit.entry.tags ? escapeValue(edit.entry.tags) : "NULL"}, updated_at = now() WHERE id = ${escapeValue(edit.targetRowId)}`
+    );
+    if (result.count === 0) {
+      throw new ContributionNotFoundError(
+        `knowledge row not found: ${edit.targetRowId}`
+      );
+    }
+    return;
+  }
+
+  const entryId = edit.entry.id;
   const entryType = edit.entry.entryType ?? "finding";
+  const useWhenColumn = hasUseWhen ? ", use_when" : "";
+  const useWhenValue = hasUseWhen
+    ? `, ${edit.entry.useWhen ? escapeValue(edit.entry.useWhen) : "NULL"}`
+    : "";
   await conn.unsafe(
-    `INSERT INTO knowledge (id, domain, entity_id, title, content, entry_type, confidence_pct, source_type, source_ref, source_node, tags) VALUES (${escapeValue(entryId)}, ${escapeValue(edit.entry.domain)}, ${escapeValue(edit.entry.entityId ?? null)}, ${escapeValue(edit.entry.title)}, ${escapeValue(edit.entry.content)}, ${escapeValue(entryType)}, ${escapeValue(confidencePct)}, ${escapeValue("external")}, ${escapeValue(ref)}, ${escapeValue(sourceNode)}, ${edit.entry.tags ? escapeValue(edit.entry.tags) : "NULL"})`
+    `INSERT INTO knowledge (id, domain, entity_id, title, content${useWhenColumn}, entry_type, confidence_pct, source_type, source_ref, source_node, tags) VALUES (${escapeValue(entryId)}, ${escapeValue(edit.entry.domain)}, ${escapeValue(edit.entry.entityId ?? null)}, ${escapeValue(edit.entry.title)}, ${escapeValue(edit.entry.content)}${useWhenValue}, ${escapeValue(entryType)}, ${escapeValue(confidencePct)}, ${escapeValue("external")}, ${escapeValue(ref)}, ${escapeValue(sourceNode)}, ${edit.entry.tags ? escapeValue(edit.entry.tags) : "NULL"})`
   );
 }
 
@@ -768,6 +877,15 @@ export class DoltgresKnowledgeContributionAdapter
     const edits = input.edits ?? [];
 
     return await this.withBranch("contribution.create", async (conn) => {
+      await conn.unsafe(`SELECT dolt_checkout('main')`);
+      if (input.idempotencyKey) {
+        const replayRows = await conn.unsafe(
+          `SELECT * FROM knowledge_contributions WHERE principal_id = ${escapeValue(input.principal.id)} AND idempotency_key = ${escapeValue(input.idempotencyKey)} LIMIT 1`
+        );
+        if (replayRows.length > 0) {
+          return mapRecord(replayRows[0] as Record<string, unknown>);
+        }
+      }
       const baseCommit = await currentHash(conn, "main");
       await conn.unsafe(
         `SELECT dolt_checkout('-b', ${escapeRef(branch)}, 'main')`
@@ -970,6 +1088,15 @@ export class DoltgresKnowledgeContributionAdapter
     return await this.withBranch(
       "contribution.create_edo_batch",
       async (conn) => {
+        await conn.unsafe(`SELECT dolt_checkout('main')`);
+        if (input.idempotencyKey) {
+          const replayRows = await conn.unsafe(
+            `SELECT * FROM knowledge_contributions WHERE principal_id = ${escapeValue(input.principal.id)} AND idempotency_key = ${escapeValue(input.idempotencyKey)} LIMIT 1`
+          );
+          if (replayRows.length > 0) {
+            return mapRecord(replayRows[0] as Record<string, unknown>);
+          }
+        }
         const baseCommit = await currentHash(conn, "main");
         await conn.unsafe(
           `SELECT dolt_checkout('-b', ${escapeRef(branch)}, 'main')`
@@ -1017,23 +1144,32 @@ export class DoltgresKnowledgeContributionAdapter
     edits: KnowledgeContributionEdit[];
   }): Promise<ContributionCommitRecord> {
     return await withContributionAppendLock(input.contributionId, async () => {
-      const rec = await this.getById(input.contributionId);
-      if (!rec) throw new ContributionNotFoundError(input.contributionId);
-      if (rec.state !== "open") {
-        throw new ContributionStateError(
-          `contribution ${input.contributionId} is ${rec.state}`
-        );
-      }
-      const seq = rec.commitCount + 1;
-      const ref = sourceRef(input.contributionId, seq);
-      const expectedHead = rec.headCommit ?? rec.baseCommit;
-      const headPredicate = rec.headCommit
-        ? `head_commit = ${escapeValue(rec.headCommit)}`
-        : "head_commit IS NULL";
-
       return await this.withBranch(
         "contribution.append_commit",
         async (conn) => {
+          // Re-read metadata only after admission and the cross-replica lock.
+          // Reading before the queue makes every caller in a burst capture the
+          // same stale head, wait its turn, then fail after doing useful work.
+          await conn.unsafe(`SELECT dolt_checkout('main')`);
+          const recordRows = await conn.unsafe(
+            `SELECT * FROM knowledge_contributions WHERE id = ${escapeValue(input.contributionId)} LIMIT 1`
+          );
+          if (recordRows.length === 0) {
+            throw new ContributionNotFoundError(input.contributionId);
+          }
+          const rec = mapRecord(recordRows[0] as Record<string, unknown>);
+          if (rec.state !== "open") {
+            throw new ContributionStateError(
+              `contribution ${input.contributionId} is ${rec.state}`
+            );
+          }
+          const seq = rec.commitCount + 1;
+          const ref = sourceRef(input.contributionId, seq);
+          const expectedHead = rec.headCommit ?? rec.baseCommit;
+          const headPredicate = rec.headCommit
+            ? `head_commit = ${escapeValue(rec.headCommit)}`
+            : "head_commit IS NULL";
+
           await conn.unsafe(`SELECT dolt_checkout(${escapeRef(rec.branch)})`);
           const actualHead = await currentHash(conn, rec.branch);
           if (
@@ -1243,23 +1379,32 @@ export class DoltgresKnowledgeContributionAdapter
     }) => Promise<{ editCount: number; message: string }>
   ): Promise<ContributionRecord> {
     return await withContributionAppendLock(input.contributionId, async () => {
-      const rec = await this.getById(input.contributionId);
-      if (!rec) throw new ContributionNotFoundError(input.contributionId);
-      if (rec.state !== "open") {
-        throw new ContributionStateError(
-          `contribution ${input.contributionId} is ${rec.state}`
-        );
-      }
-      const seq = rec.commitCount + 1;
-      const ref = sourceRef(input.contributionId, seq);
-      const expectedHead = rec.headCommit ?? rec.baseCommit;
-      const headPredicate = rec.headCommit
-        ? `head_commit = ${escapeValue(rec.headCommit)}`
-        : "head_commit IS NULL";
-
       return await this.withBranch(
         "contribution.append_edo_commit",
         async (conn) => {
+          // The record read belongs inside the same admitted, cross-replica
+          // critical section as the branch update. Otherwise concurrent EDO
+          // appends serialize only their writes and still race on a stale head.
+          await conn.unsafe(`SELECT dolt_checkout('main')`);
+          const recordRows = await conn.unsafe(
+            `SELECT * FROM knowledge_contributions WHERE id = ${escapeValue(input.contributionId)} LIMIT 1`
+          );
+          if (recordRows.length === 0) {
+            throw new ContributionNotFoundError(input.contributionId);
+          }
+          const rec = mapRecord(recordRows[0] as Record<string, unknown>);
+          if (rec.state !== "open") {
+            throw new ContributionStateError(
+              `contribution ${input.contributionId} is ${rec.state}`
+            );
+          }
+          const seq = rec.commitCount + 1;
+          const ref = sourceRef(input.contributionId, seq);
+          const expectedHead = rec.headCommit ?? rec.baseCommit;
+          const headPredicate = rec.headCommit
+            ? `head_commit = ${escapeValue(rec.headCommit)}`
+            : "head_commit IS NULL";
+
           await conn.unsafe(`SELECT dolt_checkout(${escapeRef(rec.branch)})`);
           const actualHead = await currentHash(conn, rec.branch);
           if (
@@ -1368,6 +1513,7 @@ export class DoltgresKnowledgeContributionAdapter
             id: row.from_id,
             title: row.from_title ?? null,
             content: row.from_content ?? null,
+            useWhen: row.from_use_when ?? null,
             entryType: row.from_entry_type ?? null,
             domain: row.from_domain ?? null,
           }
@@ -1377,6 +1523,7 @@ export class DoltgresKnowledgeContributionAdapter
             id: row.to_id,
             title: row.to_title ?? null,
             content: row.to_content ?? null,
+            useWhen: row.to_use_when ?? null,
             entryType: row.to_entry_type ?? null,
             domain: row.to_domain ?? null,
           }

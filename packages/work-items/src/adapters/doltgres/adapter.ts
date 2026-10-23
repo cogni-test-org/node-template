@@ -38,10 +38,56 @@ const CLAIM_TTL_SECONDS = 300;
 const COMMIT_TAG = "work-items";
 const GLOBAL_LOCK_KEY = 5_001_001;
 const OP_BRANCH_PREFIX = "work-item-op/";
+/**
+ * Where an unprovable operation branch is parked. Renaming out of
+ * `OP_BRANCH_PREFIX` is what lets writes recover: the sweep only enumerates the
+ * op namespace, so a quarantined ref stops blocking every future write while
+ * its commits stay byte-for-byte intact and inspectable.
+ */
+const QUARANTINE_BRANCH_PREFIX = "work-item-quarantine/";
 const LOCK_WAIT_MS = 2_000;
 const LOCK_RETRY_MS = 50;
 const OPERATION_QUEUE_WAIT_MS = 30_000;
 const QUERY_TIMEOUT_MS = 5_000;
+/**
+ * Budget for REF HOUSEKEEPING — `dolt_branch` create/delete/rename. Six times
+ * the DML budget, because these are not DML and they do not share its failure
+ * mode.
+ *
+ * Measured on operator production 2026-10-09: with one budget for everything,
+ * `dolt_branch` exceeded 5s under load, `terminateClient` destroyed the pool,
+ * and the PATCH 500'd AFTER its merge had already landed on `main`. Worse, the
+ * same 5s applied to the quarantine rename, so the one operation whose job is
+ * to clear a stuck branch was itself killed by the timeout — writes stayed
+ * down with the fix deployed.
+ *
+ * A longer budget here is strictly safer than a shorter one: a rename or a
+ * delete of an operation ref mutates no rows, so the only thing a timeout buys
+ * is a destroyed connection and an orphaned ref.
+ */
+const BRANCH_TIMEOUT_MS = 30_000;
+/**
+ * Stages that move REFS or SESSION STATE and write no rows — see
+ * BRANCH_TIMEOUT_MS. `branch.create` is `dolt_checkout('-b', …)` and
+ * `main.checkout` is `dolt_checkout('main')`; neither touches
+ * `public.work_items`, so neither has a half-written row for a timeout to
+ * protect. `merge.apply` and every `dml.*` stage deliberately stay on the DML
+ * budget, because those DO write rows and a runaway one must be cut off.
+ *
+ * `branch.create` belongs here for a measured reason: Doltgres ref operations
+ * get slower as refs accumulate, and the quarantine lane ADDS a ref each time
+ * it parks an unprovable branch. On operator production that closed a loop —
+ * `dolt_checkout -b` blew the 5s budget, the pool was destroyed, the orphaned
+ * branch became unprovable residue, the next attempt quarantined it and added
+ * another ref, and the following attempt was slower still. Writes to one item
+ * failed six consecutive times while a freshly created item patched fine,
+ * because the pile only has to be big enough to cross the budget.
+ */
+const BRANCH_HOUSEKEEPING_STAGES = new Set([
+  "branch.create",
+  "branch.delete",
+  "main.checkout",
+]);
 const RESERVE_TIMEOUT_MS = 5_000;
 
 /**
@@ -67,13 +113,27 @@ export interface DoltgresWorkItemAdapterOptions {
   readonly lockRetryMs?: number;
   readonly queueWaitMs?: number;
   readonly queryTimeoutMs?: number;
+  /**
+   * Budget for `dolt_branch` ref housekeeping. Defaults to 6× `queryTimeoutMs`'s
+   * default; see BRANCH_TIMEOUT_MS for why it is separate.
+   */
+  readonly branchTimeoutMs?: number;
   readonly reserveTimeoutMs?: number;
   readonly recreateClient?: () => Sql;
+  /** Rebuilds the dedicated QUERY pool after a terminal connection failure. */
+  readonly recreateReadClient?: () => Sql;
   /**
-   * Dedicated pool for the QUERY port. When provided, reads bypass the write
-   * admission queue and the advisory lock entirely — see `readOnCleanMain`.
-   * Omit it and reads keep the legacy shared-lane behaviour, so no existing
-   * consumer changes behaviour by upgrading.
+   * Dedicated pool for the QUERY port. Reads run on it instead of the write
+   * lane — see `readOnCleanMain`.
+   *
+   * Omitting it does NOT opt out of the read lane. When `recreateClient` is
+   * set, the adapter derives its own read pool from that factory on first
+   * read, because 0.1.5 shipped the read lane as an option every node had to
+   * hand-wire and not one of them did: the whole fleet kept serializing reads
+   * behind the write queue while the fix sat in the package, inert. A lane
+   * that only works when six repositories each remember to pass an argument
+   * is not a fix, so the package owns it. Pass this explicitly only to give
+   * reads a WIDER pool than the write factory builds.
    */
   readonly readClient?: Sql;
 }
@@ -108,6 +168,8 @@ interface MutationProof {
   readonly runId?: string;
   readonly command?: string;
   readonly commandProvided?: boolean;
+  /** `patch` only: the revision the compare-and-set was conditioned on. */
+  readonly expectedRevision?: number;
 }
 
 interface MutationOptions<T> {
@@ -168,6 +230,23 @@ export class WorkItemAuthorizationError extends Error {
   }
 }
 
+/**
+ * `patch` was given an `expectedRevision` that no longer matches the row.
+ * Nothing was written and no commit was made; re-read and retry.
+ */
+export class WorkItemRevisionConflictError extends Error {
+  constructor(
+    public readonly id: string,
+    public readonly expectedRevision: number,
+    public readonly currentRevision: number
+  ) {
+    super(
+      `Work item revision conflict: ${id} expected revision ${expectedRevision}, current ${currentRevision}`
+    );
+    this.name = "WorkItemRevisionConflictError";
+  }
+}
+
 export class WorkItemLeaseConflictError extends Error {
   constructor(public readonly id: string) {
     super(`Work item is claimed by another principal or lease: ${id}`);
@@ -217,6 +296,22 @@ export class WorkItemsBusyError extends Error {
   }
 }
 
+/**
+ * The branch is STRUCTURALLY verified — linear history, frozen base intact,
+ * exactly one `public.work_items` row diff, authoritative commit time — and
+ * fails only `validateTransitionMatrix`. That distinction is what makes
+ * quarantine safe: we know the ref holds at most one work-item row change, so
+ * parking it loses nothing, whereas a branch whose tip or reachability could
+ * not be established has proven nothing and must keep failing closed.
+ */
+class UnprovableTransitionError extends WorkItemsBusyError {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnprovableTransitionError";
+  }
+}
+
+
 class DoltMergeOutcomeUnknownError extends WorkItemsBusyError {
   constructor() {
     super(
@@ -254,10 +349,53 @@ function escapeValue(value: unknown): string {
  * item was fine, so the failure looked like an auth problem rather than a
  * migration one.
  */
+/**
+ * Does `creator` (a `created_by_principal_id` rendered as a string, `""` for
+ * NULL) permit `principal` to mutate the row?
+ *
+ * This is the SAME rule `mayMutate` applies to the row it reads, and the two
+ * must agree or a write is admitted and then refused. An UNADOPTED row — one
+ * created before `created_by_principal_id` existed, so NULL — is mutable by
+ * anyone: that is deliberate, because the alternative is that every work item
+ * predating the column is frozen forever with no path to adopt it.
+ *
+ * bug.5358: the transition matrix did NOT share this rule. It demanded
+ * `creator === principal` outright, so a NULL-creator row passed `mayMutate`,
+ * had its UPDATE committed to the operation branch, then failed its own
+ * transition proof — a 500, every time, with the branch left behind as
+ * unprovable residue for the next sweep to quarantine. Measured on operator
+ * production: every item created on or before 2026-10-08 returned 500 on
+ * PATCH while every item created after returned 200, because only the latter
+ * carry a creator.
+ */
+function creatorPermits(creator: string, principal: string): boolean {
+  return creator === "" || creator === principal;
+}
+
 function mayMutate(row: Record<string, unknown>, principal: string): boolean {
   const creator = row.created_by_principal_id;
   if (creator === null || creator === undefined || creator === "") return true;
   return String(creator) === principal;
+}
+
+/**
+ * `expectedRevision` is optional: omitted means an unconditioned patch, exactly
+ * as before. When present it must be the row's integer version.
+ */
+function parseExpectedRevision(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const parsed =
+    typeof value === "string"
+      ? /^\d+$/.test(value.trim())
+        ? Number(value.trim())
+        : Number.NaN
+      : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `patch: expectedRevision must be a non-negative integer (got ${String(value)})`
+    );
+  }
+  return parsed;
 }
 
 function requirePrincipal(principalId: string): string {
@@ -459,6 +597,24 @@ type PersistedColumn = (typeof PERSISTED_WORK_ITEM_COLUMNS)[number];
 type RowSnapshot = Record<PersistedColumn, unknown>;
 
 const PATCH_DB_COLUMNS = new Set<string>(Object.values(PATCH_COLUMNS));
+/**
+ * COLLABORATOR_TRIAGE (story.5096): the only fields any authenticated principal
+ * may patch on an item it did not create. A `set` naming ANY other field stays
+ * creator-bound as a whole.
+ */
+const TRIAGE_PATCH_KEYS = new Set<keyof WorkItemsPatchSet>([
+  "priority",
+  "rank",
+  "labels",
+]);
+/** The full row-diff surface a non-creator patch may prove. */
+const TRIAGE_COLUMNS = new Set<string>([
+  "priority",
+  "rank",
+  "labels",
+  "revision",
+  "updated_at",
+]);
 const IMMUTABLE_COLUMNS = new Set<string>([
   "id",
   "type",
@@ -673,8 +829,14 @@ function validateTransitionMatrix(
       return (
         String(before.id) === itemId &&
         String(after.id) === itemId &&
-        creatorBefore === proof.principal &&
-        creatorAfter === proof.principal &&
+        // `created_by_principal_id` is immutable, so the equality below also
+        // forbids a patch from quietly adopting an unadopted row.
+        creatorBefore === creatorAfter &&
+        (creatorPermits(creatorBefore, proof.principal) ||
+          (proof.principal.length > 0 &&
+            onlyAllowedChanges(changed, TRIAGE_COLUMNS))) &&
+        (proof.expectedRevision === undefined ||
+          beforeRevision === proof.expectedRevision) &&
         [...IMMUTABLE_COLUMNS].every(
           (column) =>
             JSON.stringify(before[column as PersistedColumn]) ===
@@ -696,7 +858,7 @@ function validateTransitionMatrix(
     case "delete":
       return (
         String(before.id) === itemId &&
-        creatorBefore === proof.principal &&
+        creatorPermits(creatorBefore, proof.principal) &&
         isNullSnapshot(after)
       );
     case "claim": {
@@ -835,9 +997,18 @@ export class DoltgresWorkItemAdapter
   private readonly lockRetryMs: number;
   private readonly queueWaitMs: number;
   private readonly queryTimeoutMs: number;
+  private readonly branchTimeoutMs: number;
   private readonly reserveTimeoutMs: number;
   private readonly recreateClient: (() => Sql) | undefined;
-  private readonly readClient: Sql | undefined;
+  private readClient: Sql | undefined;
+  private readonly recreateReadClient: (() => Sql) | undefined;
+  private readonly readLaneConfigured: boolean;
+  /**
+   * Read pool derived from `recreateClient` when the caller passed no
+   * `readClient`. Built on first read, not in the constructor: a node that
+   * never reads must not pay for a connection, and construction must not
+   * depend on the database being reachable.
+   */
   private readonly terminatingPools = new WeakMap<object, Promise<void>>();
 
   constructor(
@@ -850,9 +1021,15 @@ export class DoltgresWorkItemAdapter
     this.lockRetryMs = options.lockRetryMs ?? LOCK_RETRY_MS;
     this.queueWaitMs = options.queueWaitMs ?? OPERATION_QUEUE_WAIT_MS;
     this.queryTimeoutMs = options.queryTimeoutMs ?? QUERY_TIMEOUT_MS;
+    this.branchTimeoutMs = options.branchTimeoutMs ?? BRANCH_TIMEOUT_MS;
     this.reserveTimeoutMs = options.reserveTimeoutMs ?? RESERVE_TIMEOUT_MS;
     this.recreateClient = options.recreateClient;
     this.readClient = options.readClient;
+    this.recreateReadClient =
+      options.recreateReadClient ?? options.recreateClient;
+    this.readLaneConfigured = Boolean(
+      options.readClient || options.recreateReadClient || options.recreateClient
+    );
   }
 
   private logStage(
@@ -932,10 +1109,13 @@ export class DoltgresWorkItemAdapter
     const queryFields = branch ? { branch } : {};
     this.logStage("info", context, stage, "start", queryFields);
     const pending = conn.unsafe(query);
+    const budgetMs = BRANCH_HOUSEKEEPING_STAGES.has(stage)
+      ? Math.max(this.branchTimeoutMs, this.queryTimeoutMs)
+      : this.queryTimeoutMs;
     const timeoutTimer = setTimeout(() => {
       timedOut = true;
       void this.terminateClient(pool, context, stage, "query_timeout");
-    }, this.queryTimeoutMs);
+    }, budgetMs);
     try {
       const rows = (await pending) as ReadonlyArray<Record<string, unknown>>;
       if (timedOut) {
@@ -1370,7 +1550,7 @@ export class DoltgresWorkItemAdapter
       pending?.proof ??
       legacyProofFromMessage(String(commit.message ?? ""), before, after);
     if (!proof || !validateTransitionMatrix(proof, before, after, commitAt)) {
-      throw new WorkItemsBusyError(
+      throw new UnprovableTransitionError(
         `Work-item branch ${branch} failed its operation proof; preserving evidence`
       );
     }
@@ -1755,7 +1935,38 @@ export class DoltgresWorkItemAdapter
           reconciliation
         );
       } catch (error) {
-        if (reconciliation === "required") throw error;
+        if (reconciliation === "required") {
+          // ONLY the structurally-verified arm is quarantinable. A branch whose
+          // tip is missing, or whose reachability could not be proven, has
+          // established nothing about its contents — parking it could hide
+          // arbitrary divergence, so those keep failing closed exactly as
+          // before.
+          if (!(error instanceof UnprovableTransitionError)) throw error;
+          // ONE UNPROVABLE BRANCH MUST NOT BLOCK EVERY FUTURE WRITE.
+          // bug.5358 left this arm throwing, which made writes permanently
+          // unavailable on a node carrying a single residual branch: nothing
+          // deletes a `preserved_unsafe` ref, and this sweep re-walks
+          // `dolt.branches` on every request, so no restart clears it. Measured
+          // on operator production — a promote failed at 05:27:04Z, the lost
+          // `branch.create` ack left `work-item-op/9ee34c81…` behind at
+          // 05:28:33Z, and 88 consecutive write attempts 503'd over the next
+          // two hours while reads stayed 200.
+          //
+          // Quarantine rather than delete. The branch reached this arm having
+          // ALREADY passed every structural check — linear history, frozen base
+          // intact, exactly one `public.work_items` row diff, authoritative
+          // commit time — and fails only its transition proof. So it may hold a
+          // real one-row write, and deleting it is the data loss bug.5358 was
+          // filed to prevent. Renaming it out of the enumerated namespace
+          // preserves those commits byte-for-byte with zero data mutation,
+          // keeps them reachable for a human to merge, and unblocks writes now.
+          // A failed rename still throws: quarantine must not be best-effort,
+          // or a write would proceed believing evidence was parked when it was
+          // not.
+          await this.quarantineOperationBranch(conn, branch, error);
+          tolerated = true;
+          continue;
+        }
         tolerated = true;
       }
     }
@@ -1934,6 +2145,32 @@ export class DoltgresWorkItemAdapter
     await this.deleteOperationBranch(conn, branch);
   }
 
+  /**
+   * Move an unprovable operation branch out of the swept namespace, loudly.
+   * `error` is the proof failure that sent it here and is logged with it, so
+   * the quarantine record says WHY this ref could not be proven rather than
+   * just that it moved.
+   */
+  private async quarantineOperationBranch(
+    conn: WorkItemConnection,
+    branch: string,
+    error: unknown
+  ): Promise<void> {
+    const target = `${QUARANTINE_BRANCH_PREFIX}${branch.slice(
+      OP_BRANCH_PREFIX.length
+    )}`;
+    const rows = await conn.unsafe(
+      `SELECT dolt_branch('-m', ${escapeValue(branch)}, ${escapeValue(target)})`
+    );
+    assertDoltStatus(rows, "dolt_branch");
+    this.logReconciliation("warn", conn, {
+      branch,
+      quarantinedAs: target,
+      classification: "quarantined_unprovable",
+      ...errorFields(error),
+    });
+  }
+
   private async deleteOperationBranch(
     conn: WorkItemConnection,
     branch: string
@@ -1959,9 +2196,11 @@ export class DoltgresWorkItemAdapter
    * peaked at 7334 ms while the actual `dml.read` was 677 ms — a dashboard
    * firing four list calls took ~30 s to paint.
    *
-   * With `readClient` the read path reserves from its own pool and runs the
-   * query. It never calls `dolt_checkout`, never takes the lock, and never
-   * reconciles, so read concurrency equals that pool's width.
+   * The read path runs on a pool of its own — `readClient` when the caller
+   * passed one, otherwise one the adapter derives from `recreateClient`. It
+   * never calls `dolt_checkout`, never takes the lock, and never reconciles,
+   * so read concurrency equals that pool's width and no read ever waits on a
+   * write. Only a consumer that passes neither falls back to the shared lane.
    *
    * WHY NOT CHECKING OUT IS SAFE: a fresh connection opens on the database's
    * default branch, which is `main`. This lane never moves it, so every read
@@ -1970,10 +2209,52 @@ export class DoltgresWorkItemAdapter
    * observe. Reads remain available through residual branch evidence, which is
    * the bug.5358 guarantee, and they no longer pay to enumerate it.
    */
+  /**
+   * The pool reads run on, or `undefined` when there is none and reads must
+   * take the shared write lane.
+   *
+   * `recreateClient` is the caller's own factory for a work-items connection,
+   * so a pool built from it has the right URL, the right `application_name`
+   * shape, and the right driver options by construction — nothing here has to
+   * guess a DSN. Reads need their OWN pool rather than a second checkout from
+   * the write pool because that pool is `max: 1` on every node in the fleet:
+   * sharing it would put every read back behind the in-flight write.
+   */
+  private resolveReadPool(): Sql | undefined {
+    if (this.readClient) return this.readClient;
+    if (!this.recreateReadClient) {
+      if (this.readLaneConfigured) {
+        throw new WorkItemsBusyError(
+          "Work-item read lane requires a fresh connection; retry shortly"
+        );
+      }
+      return undefined;
+    }
+    try {
+      this.readClient = this.recreateReadClient();
+    } catch (error) {
+      this.logger.warn(
+        {
+          event: "adapter.work_items.read_pool_derive_failed",
+          ...errorFields(error),
+        },
+        "work_items could not rebuild its dedicated read pool"
+      );
+      throw new WorkItemsBusyError(
+        "Work-item read lane could not reconnect; retry shortly"
+      );
+    }
+    this.logger.info(
+      { event: "adapter.work_items.read_pool_derived" },
+      "work_items derived a dedicated read pool from recreateClient"
+    );
+    return this.readClient;
+  }
+
   private async readOnCleanMain<T>(
     fn: (conn: WorkItemConnection) => Promise<T>
   ): Promise<T> {
-    const readPool = this.readClient;
+    const readPool = this.resolveReadPool();
     if (!readPool) {
       // Legacy shared lane — unchanged for consumers that pass no read client.
       return this.withOperationQueue("read work items", (context) =>
@@ -1996,18 +2277,21 @@ export class DoltgresWorkItemAdapter
         )
       );
     } catch (error) {
-      // A query timeout terminates the pool it ran on, and `recreateClient`
-      // only rebuilds the WRITE client — so a terminated read pool would stay
-      // dead. Fall back to the shared lane for this call rather than failing a
-      // read the legacy path could still serve. Slow beats unavailable, and
-      // bug.5358's whole point is that reads stay available.
+      // A terminal read error has already condemned this pool in
+      // `executeQuery`. Forget it so the next request gets a clean generation.
+      // Never retry on the write lane: a server-side query panic would execute
+      // the same query again there, poison the session-pinned pool, and turn a
+      // read defect into a fleet-wide write outage.
+      if (!(error instanceof WorkItemsBusyError)) throw error;
+      if (readPool === this.readClient) this.readClient = undefined;
       this.logger.warn(
-        { event: "adapter.work_items.read_lane_fallback", ...errorFields(error) },
-        "work_items read lane failed; retrying on the shared lane"
+        {
+          event: "adapter.work_items.read_lane_unavailable",
+          ...errorFields(error),
+        },
+        "work_items read lane failed; a fresh pool will serve the next retry"
       );
-      return this.withOperationQueue("read work items", (ctx) =>
-        this.withGlobalLock(ctx, fn, { reconcile: "best_effort" })
-      );
+      throw error;
     }
   }
 
@@ -2052,13 +2336,7 @@ export class DoltgresWorkItemAdapter
       const nodes = Array.isArray(query.node) ? query.node : [query.node];
       conditions.push(`node IN (${nodes.map(escapeValue).join(", ")})`);
     }
-    if (query.text) {
-      const escaped = query.text.toLowerCase().replace(/[%_\\]/g, "\\$&");
-      const pattern = escapeValue(`%${escaped}%`);
-      conditions.push(
-        `(LOWER(title) LIKE ${pattern} OR LOWER(COALESCE(summary,'')) LIKE ${pattern})`
-      );
-    }
+    const textNeedle = query.text?.toLowerCase();
     if (query.cursor) {
       const cursor = decodeCursor(query.cursor);
       const priority = cursor.p ?? 999;
@@ -2076,11 +2354,25 @@ export class DoltgresWorkItemAdapter
     const rows = await this.readOnCleanMain(
       async (conn) =>
         (await conn.unsafe(
-          `SELECT *, (claim_expires_at IS NOT NULL AND claim_expires_at > NOW()) AS claim_active FROM work_items ${where} ORDER BY COALESCE(priority, 999) ASC, COALESCE(rank, 999) ASC, created_at DESC, id ASC LIMIT ${limit + 1}`
+          `SELECT *, (claim_expires_at IS NOT NULL AND claim_expires_at > NOW()) AS claim_active FROM work_items ${where} ORDER BY COALESCE(priority, 999) ASC, COALESCE(rank, 999) ASC, created_at DESC, id ASC${textNeedle ? "" : ` LIMIT ${limit + 1}`}`
         )) as ReadonlyArray<Record<string, unknown>>
     );
-    const hasMore = rows.length > limit;
-    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    // Doltgres 0.57.3 panics when LOWER() receives an out-of-line TEXT value
+    // (`*val.TextStorage`). It also has no ILIKE. Keep every structural filter
+    // and the keyset in SQL, then case-fold the remaining ordered shelf here.
+    // The SQL LIMIT must be absent on this path or a match beyond the first N
+    // rows would be silently lost.
+    const matchedRows = textNeedle
+      ? rows.filter((row) =>
+          [row.title, row.summary].some((value) =>
+            String(value ?? "")
+              .toLowerCase()
+              .includes(textNeedle)
+          )
+        )
+      : rows;
+    const hasMore = matchedRows.length > limit;
+    const pageRows = hasMore ? matchedRows.slice(0, limit) : matchedRows;
     const items = pageRows.map(rowToWorkItem);
     let endCursor: string | null = null;
     if (hasMore && pageRows.length) {
@@ -2213,37 +2505,76 @@ export class DoltgresWorkItemAdapter
     principalId: string
   ): Promise<WorkItem> {
     const principal = requirePrincipal(principalId);
+    const id = input.id as string;
+    const expectedRevision = parseExpectedRevision(input.expectedRevision);
     const clauses: string[] = [];
+    const setKeys: (keyof WorkItemsPatchSet)[] = [];
     for (const [key, column] of Object.entries(PATCH_COLUMNS) as [
       keyof WorkItemsPatchSet,
       string,
     ][]) {
       const value = input.set[key];
-      if (value !== undefined)
+      if (value !== undefined) {
         clauses.push(`${column} = ${escapeValue(value)}`);
+        setKeys.push(key);
+      }
     }
+    const triageOnly =
+      setKeys.length > 0 && setKeys.every((key) => TRIAGE_PATCH_KEYS.has(key));
+    const permits = (row: Record<string, unknown>) =>
+      triageOnly || mayMutate(row, principal);
+    const revisionConflict = (row: Record<string, unknown>) => {
+      const currentRevision = Number(row.revision ?? 0);
+      return expectedRevision !== undefined &&
+        currentRevision !== expectedRevision
+        ? new WorkItemRevisionConflictError(
+            id,
+            expectedRevision,
+            currentRevision
+          )
+        : undefined;
+    };
     if (!clauses.length) {
       return this.readOnCleanMain(async (conn) => {
         const current = await this.getWith(conn, input.id);
-        if (!current)
-          throw new Error(`Work item not found: ${input.id as string}`);
+        if (!current) throw new Error(`Work item not found: ${id}`);
         if (!mayMutate(current, principal)) {
-          throw new WorkItemAuthorizationError(input.id as string);
+          throw new WorkItemAuthorizationError(id);
         }
+        const conflict = revisionConflict(current);
+        if (conflict) throw conflict;
         return rowToWorkItem(current);
       });
     }
 
-    return this.mutate(
-      `patch ${input.id as string}`,
+    const where = [`id = ${escapeValue(id)}`];
+    if (!triageOnly) {
+      where.push(
+        `(created_by_principal_id IS NULL OR created_by_principal_id = ${escapeValue(principal)})`
+      );
+    }
+    if (expectedRevision !== undefined) {
+      where.push(`revision = ${escapeValue(expectedRevision)}`);
+    }
+    const result = await this.mutate<WorkItem | WorkItemRevisionConflictError>(
+      `patch ${id}`,
       principal,
       async (conn, proof) => {
         clauses.push("revision = revision + 1", "updated_at = NOW()");
         const rows = await conn.unsafe(
-          `UPDATE work_items SET ${clauses.join(", ")} WHERE id = ${escapeValue(input.id as string)} AND (created_by_principal_id IS NULL OR created_by_principal_id = ${escapeValue(principal)}) RETURNING *, (claim_expires_at IS NOT NULL AND claim_expires_at > NOW()) AS claim_active`
+          `UPDATE work_items SET ${clauses.join(", ")} WHERE ${where.join(" AND ")} RETURNING *, (claim_expires_at IS NOT NULL AND claim_expires_at > NOW()) AS claim_active`
         );
         const row = rows[0] as Record<string, unknown> | undefined;
-        if (!row) await this.throwMissingOrUnauthorized(conn, input.id);
+        if (!row) {
+          // CAS lost after preflight: a writer outside this lock moved the
+          // revision. Returned, not thrown, so `shouldCommit` drops the empty
+          // op branch with nothing committed (the no-op path delete uses).
+          const current = await this.getWith(conn, input.id);
+          const conflict =
+            current && permits(current) ? revisionConflict(current) : undefined;
+          if (conflict) return conflict;
+          await this.throwMissingOrUnauthorized(conn, input.id);
+        }
         proof.afterRow = row as Record<string, unknown>;
         return rowToWorkItem(row as Record<string, unknown>);
       },
@@ -2251,27 +2582,27 @@ export class DoltgresWorkItemAdapter
         proof: {
           verb: "patch",
           principal,
-          itemId: input.id as string,
+          itemId: id,
+          expectedRevision,
           patchValues: Object.fromEntries(
-            (Object.entries(PATCH_COLUMNS) as [
-              keyof WorkItemsPatchSet,
-              string,
-            ][])
-              .filter(([key]) => input.set[key] !== undefined)
-              .map(([key, column]) => [column, input.set[key]])
+            setKeys.map((key) => [PATCH_COLUMNS[key], input.set[key]])
           ),
         },
         preflight: async (conn, proof) => {
           const current = await this.getWith(conn, input.id);
-          if (!current)
-            throw new Error(`Work item not found: ${input.id as string}`);
-          if (!mayMutate(current, principal)) {
-            throw new WorkItemAuthorizationError(input.id as string);
+          if (!current) throw new Error(`Work item not found: ${id}`);
+          if (!permits(current)) {
+            throw new WorkItemAuthorizationError(id);
           }
+          const conflict = revisionConflict(current);
+          if (conflict) throw conflict;
           proof.beforeRow = current;
         },
+        shouldCommit: (value) => !(value instanceof WorkItemRevisionConflictError),
       }
     );
+    if (result instanceof WorkItemRevisionConflictError) throw result;
+    return result;
   }
 
   async delete(id: WorkItemId, principalId: string): Promise<boolean> {

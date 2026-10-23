@@ -53,6 +53,46 @@ const CASES = [
     expectExit: 0,
   },
   {
+    name: "detection must build the contract its target reader imports",
+    mutate: edit(
+      ".github/workflows/pr-build.yml",
+      "      - name: Build repo-spec contract\n        run: pnpm --filter @cogni/repo-spec build",
+      "      - name: Build repo-spec contract\n        run: pnpm check"
+    ),
+    expectExit: 1,
+    expectMatch: /detect dependency build/,
+  },
+  {
+    name: "a second detection step must not rerun the suite under another name",
+    mutate: edit(
+      ".github/workflows/pr-build.yml",
+      "      - name: Detect node image targets",
+      "      - name: Redundant verification\n        run: pnpm test:ci\n\n      - name: Detect node image targets"
+    ),
+    expectExit: 1,
+    expectMatch: /jobs.detect must not duplicate CI checks or tests/,
+  },
+  {
+    name: "removing detection checks must not remove the required unit suite",
+    mutate: edit(
+      ".github/workflows/ci.yaml",
+      "run: pnpm test:ci",
+      "run: echo tests skipped"
+    ),
+    expectExit: 1,
+    expectMatch: /unit test command/,
+  },
+  {
+    name: "schema verification remains owned by required static CI",
+    mutate: edit(
+      ".github/workflows/ci.yaml",
+      "run: pnpm db:check",
+      "run: echo schema checks skipped"
+    ),
+    expectExit: 1,
+    expectMatch: /static Database schema checks command/,
+  },
+  {
     name: "renaming a required job breaks the emitted context (the deadlock case)",
     mutate: edit(".github/workflows/ci.yaml", "\n  unit:\n", "\n  unit:\n    name: Unit Tests\n"),
     expectExit: 1,
@@ -168,8 +208,8 @@ const CASES = [
     name: "deleting a registry entry while its tag filter remains is rejected",
     mutate: edit(
       ".github/workflows/publish-packages.yml",
-      '"knowledge-store-v"},\n     {"name":"@cogni-dao/knowledge-base","dir":"packages/knowledge-base","tagPrefix":"knowledge-base-v"}]',
-      '"knowledge-store-v"}]'
+      '     {"name":"@cogni-dao/knowledge-base","dir":"packages/knowledge-base","tagPrefix":"knowledge-base-v"},\n',
+      ""
     ),
     expectExit: 1,
     expectMatch: /tag filter "knowledge-base-v\*" matches no env\.PACKAGES entry/,
