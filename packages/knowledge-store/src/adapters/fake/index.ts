@@ -37,6 +37,7 @@ import type {
   WalkChainOptions,
 } from "../../port/edo-resolver.port.js";
 import {
+  type CitationLinkPage,
   CitationTargetNotFoundError,
   CitationTypeMismatchError,
   type Domain,
@@ -86,12 +87,18 @@ export class FakeKnowledgeStoreAdapter implements KnowledgeStorePort {
 
   async listKnowledge(
     domain: string,
-    opts?: { tags?: string[]; limit?: number }
+    opts?: { tags?: string[]; limit?: number; q?: string }
   ): Promise<Knowledge[]> {
     let out = Array.from(this.rows.values()).filter((r) => r.domain === domain);
     if (opts?.tags?.length) {
       const wanted = new Set(opts.tags);
       out = out.filter((r) => (r.tags ?? []).some((t) => wanted.has(t)));
+    }
+    const needle = opts?.q?.trim().toLowerCase();
+    if (needle) {
+      // Mirrors the Doltgres adapter: case-insensitive substring on `useWhen`
+      // only; a null trigger never matches.
+      out = out.filter((r) => r.useWhen?.toLowerCase().includes(needle));
     }
     out.sort(
       (a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0)
@@ -308,6 +315,31 @@ export class FakeKnowledgeStoreAdapter implements KnowledgeStorePort {
     return Array.from(this.edges.values()).filter((c) => c.citedId === citedId);
   }
 
+  async listCitationLinks(
+    endpointId: string,
+    after?: string
+  ): Promise<CitationLinkPage> {
+    const candidates = Array.from(this.edges.values())
+      .filter(
+        (c) =>
+          (c.citingId === endpointId || c.citedId === endpointId) &&
+          (!after || c.id > after)
+      )
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const links = candidates.slice(0, 5).map((c) => ({
+      id: c.id,
+      citingId: c.citingId,
+      citedId: c.citedId,
+      citationType: c.citationType,
+      context: c.context ?? null,
+      sourceTitle: this.rows.get(c.citingId)?.title ?? null,
+      targetTitle: this.rows.get(c.citedId)?.title ?? null,
+    }));
+    return {
+      links,
+      nextCursor: candidates.length > 5 ? (links.at(-1)?.id ?? null) : null,
+    };
+  }
   async listAllCitations(): Promise<Citation[]> {
     return Array.from(this.edges.values());
   }

@@ -46,6 +46,22 @@ export interface NewDomain {
   description?: string;
 }
 
+/** Direct-edge read model: no knowledge bodies or work-item outcomes. */
+export interface CitationLinkSummary {
+  id: string;
+  citingId: string;
+  citedId: string;
+  citationType: CitationType;
+  context: string | null;
+  sourceTitle: string | null;
+  targetTitle: string | null;
+}
+
+export interface CitationLinkPage {
+  links: CitationLinkSummary[];
+  nextCursor: string | null;
+}
+
 /**
  * The knowledge write plane is saturated or recovering; the caller may retry.
  *
@@ -164,9 +180,19 @@ export class EdoEntryTypeRequiresAtomicToolError extends Error {
 export interface KnowledgeStorePort {
   // --- Read ---
   getKnowledge(id: string): Promise<Knowledge | null>;
+  /**
+   * Rows on one shelf, newest first.
+   *
+   * `q` is a case-insensitive substring match against `useWhen` ONLY — the
+   * retrieval trigger, the field that names the reader's situation. It is the
+   * filter `/knowledge/index` needs to answer "which triggers match mine?"
+   * without downloading bodies (task.5204). Rows whose `useWhen` is null never
+   * match. Full-text over title/content stays `searchKnowledge`; these are two
+   * questions, not one endpoint with modes.
+   */
   listKnowledge(
     domain: string,
-    opts?: { tags?: string[]; limit?: number }
+    opts?: { tags?: string[]; limit?: number; q?: string }
   ): Promise<Knowledge[]>;
   searchKnowledge(
     domain: string,
@@ -229,6 +255,12 @@ export interface KnowledgeStorePort {
   listCitationsByCitingId(citingId: string): Promise<Citation[]>;
   /** List edges where cited_id = id (incoming). Used by recomputeConfidence. */
   listCitationsByCitedId(citedId: string): Promise<Citation[]>;
+  /** Five direct relations per page; never traverses or reads endpoint bodies. */
+  listCitationLinks(
+    endpointId: string,
+    after?: string
+  ): Promise<CitationLinkPage>;
+
   /**
    * List every citation edge in a single query. Used to assemble the full
    * knowledge graph without an N+1 over entries — the caller filters to edges
