@@ -27,7 +27,7 @@ export function KnowledgeUseWhen({
 
   return (
     <p className={className}>
-      <span>Use when:</span> {trigger}
+      <span>Use when (TEST P2):</span> {trigger}
     </p>
   );
 }
