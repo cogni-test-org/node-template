@@ -272,10 +272,30 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-          cache: pnpm
+
+      - name: Verify frozen contract install rejects lock mismatch
+        run: |
+          set -euo pipefail
+          negative_root="$(mktemp -d "$RUNNER_TEMP/repo-spec-lock-negative.XXXXXX")"
+          trap 'rm -rf "$negative_root"' EXIT
+          mkdir -p "$negative_root/packages/repo-spec"
+          cp package.json pnpm-lock.yaml pnpm-workspace.yaml "$negative_root/"
+          cp packages/repo-spec/package.json "$negative_root/packages/repo-spec/package.json"
+          node -e 'const fs = require("node:fs"); const file = process.argv[1]; const value = JSON.parse(fs.readFileSync(file, "utf8")); value.dependencies.yaml = "0.0.0-frozen-negative"; fs.writeFileSync(file, JSON.stringify(value));' "$negative_root/packages/repo-spec/package.json"
+          if (cd "$negative_root" && pnpm --filter @cogni/repo-spec... install --frozen-lockfile --ignore-scripts --config.dedupe-peer-dependents=false) > "$negative_root/install.log" 2>&1; then
+            echo '::error::frozen contract install accepted a mismatched lockfile'
+            exit 1
+          fi
+          grep -F 'ERR_PNPM_OUTDATED_LOCKFILE' "$negative_root/install.log"
+          git diff --exit-code -- package.json pnpm-lock.yaml pnpm-workspace.yaml packages/repo-spec/package.json
 
       - name: Install
-        run: pnpm install --frozen-lockfile
+        run: |
+          set -euo pipefail
+          pnpm --filter @cogni/repo-spec... install --frozen-lockfile --ignore-scripts --config.dedupe-peer-dependents=false
+          node -e 'const fs = require("node:fs"); const root = JSON.parse(fs.readFileSync("package.json", "utf8")); const spec = JSON.parse(fs.readFileSync("packages/repo-spec/package.json", "utf8")); console.log(JSON.stringify({ rootDevDependencies: Object.keys(root.devDependencies), contractDependencies: Object.keys(spec.dependencies), installedPackageDirectories: fs.readdirSync("node_modules/.pnpm", { withFileTypes: true }).filter(entry => entry.isDirectory()).length }));'
+          du -sk node_modules "$(pnpm store path --silent)"
+          git diff --exit-code -- package.json pnpm-lock.yaml pnpm-workspace.yaml packages/repo-spec/package.json
 
       - name: Build repo-spec contract
         run: pnpm --filter @cogni/repo-spec build
