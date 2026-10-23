@@ -62,3 +62,7 @@ governance:
 distributions:
   status: active
   claim_contract_pattern: uniswap.merkle-distributor.v1
+
+# TEST-only negative fixture: empty services must be rejected.
+deployment:
+  services: []
